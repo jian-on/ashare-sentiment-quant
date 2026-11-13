@@ -1,50 +1,93 @@
 # -*- coding: utf-8 -*-
 """
 config.py — 全局参数配置
-改动点说明：
-- 所有可调参数集中于此，便于回测时做参数敏感性分析（防过拟合的第一步：参数显式化）
+
+2026-11-13 多智能体审计后的修订（详见 RESEARCH_2026-11-13.md）：
+- 移除 market_beta 权重：它是同一截面常数，对横截面排序零贡献，只让 composite 跨日漂移
+- 启用 vol_trend：原代码算了「极端放量扣分」却从未进权重字典，是死代码
+- turnover_z 改由 spot 换手率横截面分位生成（腾讯K线无历史换手率，原实现恒为 0）
+- sentiment 改为横截面标准化后打分，且前置到候选集（原实现只对已入选 Top10 补分，是选择偏差）
+- 新增「市场状态自适应权重」实验开关，默认关闭 —— 未通过样本外检验前不得当作有效改进
+
 风险提示：
 - min_amount / top_n 等参数调得越"漂亮"越容易过拟合，建议用滚动窗口验证后再调
+- 所有权重为待验证假设，不是已被证明有效的最优参数
 """
 
 # ========== 数据与缓存 ==========
-CACHE_DIR = "data_cache"          # 本地缓存目录（避免反复请求东财接口触发反爬）
-HIST_DAYS = 120                   # 拉取的历史K线交易日数（因子计算需要60+日）
+CACHE_DIR = "data_cache"
+HIST_DAYS = 120
 
-# ========== 实时性口径（用户要求：只用实时数据，不接受降级） ==========
+# ========== 实时性口径 ==========
 ALLOW_STALE_FALLBACK = False      # False=严格实时：任何源都失败时直接报错，绝不返回过期缓存
-SPOT_TTL_SEC = 60                 # 全A快照缓存：1分钟（腾讯批量仅1秒，可放宽实时性）
-HIST_TTL_SEC = 300                # 单股K线缓存：5分钟（盘中当日K线5分钟内视为实时）
-MIN_REQUEST_INTERVAL = 0.5        # 仅用于东财备源节流（腾讯主源是批量+并发，无需节流）
+SPOT_TTL_SEC = 60
+HIST_TTL_SEC = 300
+MIN_REQUEST_INTERVAL = 0.5
+STRICT_ASOF = True                # 快照带 asof 时间列；打分时校验截面一致性（见 sources.py f[30]）
 
-# ========== 界面点击冷却（防手快连续触发；数据源换成腾讯后不再需要长冷却） ==========
-UI_COOLDOWN_SEC = 30              # 一次成功拉取后冷却30秒（5分钟内重扫会命中K线缓存，几乎秒出）
-RATE_LIMIT_COOLDOWN = 120         # 两源均失败时冷却2分钟
+# ========== 界面点击冷却 ==========
+UI_COOLDOWN_SEC = 30
+RATE_LIMIT_COOLDOWN = 120
 
-# ========== 标的过滤（规则1：ST/停牌/次新/低流动性） ==========
-MIN_AMOUNT = 50_000_000           # 日均成交额下限：5000万元（过滤流动性极小票）
-MIN_LISTED_DAYS = 60              # 上市不足60个交易日剔除（次新股情绪波动大且无法算长因子）
-EXCLUDE_ST = True                 # 剔除ST/*ST/退市整理
-EXCLUDE_BJ = True                 # 剔除北交所（流动性/规则差异大，短线模型先不做）
-EXCLUDE_688 = False               # 是否剔除科创板（20cm涨跌幅，与主板10cm不同，默认保留但注意混池风险）
+# ========== 标的过滤 ==========
+MIN_AMOUNT = 50_000_000
+MIN_LISTED_DAYS = 60
+EXCLUDE_ST = True
+EXCLUDE_BJ = True
+EXCLUDE_688 = False
+INCLUDE_CHINEXT = True            # 2026-11-13 修复：原 filter_universe 只认 60/00/688，
+                                  # 创业板 300/301 被静默全部剔除，与题材短线主线冲突
 
-# ========== 短线因子权重（因子方向已统一为"分数越高越好"） ==========
+# 候选池选样方式：
+#   "stratified" = 按当日成交额分位分 5 层等额抽样（固定种子，可复现），避免只选到大盘蓝筹
+#   "top_amount" = 旧行为，成交额降序取前 N（存在「用当日结果选样」的自我指涉偏差）
+POOL_SELECT_MODE = "stratified"
+POOL_STRATA = 5
+POOL_RANDOM_SEED = 42
+
+# ========== 因子权重（修复后的基准，方向统一为"分越高越好"，和为 1.0）==========
 FACTOR_WEIGHTS = {
-    "reversal_5d":   0.20,   # 5日反转：短线超跌反弹倾向（A股短线反转效应显著）
-    "turnover_z":    0.15,   # 换手率活跃度：适度放量加分，过度放量（情绪顶部）减分
-    "volume_ratio":  0.10,   # 量比：当日相对近期成交的放大程度
-    "low_vol":       0.10,   # 低波动：20日收益率波动越小越好
-    "pos_in_20d":    0.10,   # 20日价格位置：处于区间低位加分（配合反转）
-    "sentiment":     0.25,   # 舆情情绪分（核心因子，用户指定主线）
-    "market_beta":   0.10,   # 市场情绪温度（涨跌家数比/涨停数映射到个股的加成）
+    "reversal_5d":  0.18,   # 5日超跌反转
+    "pos_in_20d":   0.12,   # 20日区间低位（2026-11-13 修复双重反向）
+    "low_vol":      0.10,   # 低波动
+    "vol_trend":    0.10,   # 量能趋势；>2.5 倍极端放量转为扣分（原来未启用）
+    "turnover_z":   0.10,   # 换手活跃度；改由 spot 换手率横截面分位生成（原来恒 0）
+    "volume_ratio": 0.10,   # 量比
+    "sentiment":    0.30,   # 舆情情绪分（核心主线）；横截面 z 标准化后进入
 }
 
-# ========== 回测参数（规则3：手续费/滑点/滚动窗口） ==========
-COMMISSION = 0.00025              # 佣金 万2.5
-COMMISSION_MIN = 5.0              # 最低佣金5元
-STAMP_TAX = 0.0005                # 印花税：卖出 万5（2023-08后税率）
-SLIPPAGE = 0.001                  # 滑点：单边0.1%（短线小票实际可能更高）
-TOP_N = 20                        # 每期持有得分最高的N只，等权
-TRAIN_DAYS = 120                  # 训练窗口
-VALID_DAYS = 60                   # 验证窗口
-OOS_DAYS = 60                     # 样本外窗口
+# ========== 市场状态自适应权重（实验性，默认关闭）==========
+# 依据：A股动量-反转混合结构 —— 高潮期动量占优、退潮期反转失效需防守。
+# 这是 2026-11-13 单日复盘归纳的待验证假设，未经本项目样本外回测证明，可能被证伪。
+ENABLE_REGIME_ADAPT = False
+REGIME_DEFAULT_STATE = "回暖"
+REGIME_WEIGHTS = {
+    #              反转   位置   低波   量能趋势  换手   量比   舆情   = 合计
+    "冰点": {"reversal_5d": 0.22, "pos_in_20d": 0.15, "low_vol": 0.18,
+             "vol_trend": 0.06, "turnover_z": 0.06, "volume_ratio": 0.05, "sentiment": 0.28},
+    "回暖": dict(FACTOR_WEIGHTS),   # 基准权重
+    "高潮": {"reversal_5d": 0.06, "pos_in_20d": 0.04, "low_vol": 0.06,
+             "vol_trend": 0.12, "turnover_z": 0.20, "volume_ratio": 0.18, "sentiment": 0.34},
+    "退潮": {"reversal_5d": 0.05, "pos_in_20d": 0.05, "low_vol": 0.28,
+             "vol_trend": 0.06, "turnover_z": 0.08, "volume_ratio": 0.08, "sentiment": 0.40},
+}
+
+# ========== 舆情打分范围 ==========
+# 原实现先按无舆情分取 Top10、再只对这 10 只补舆情，舆情从不影响"谁入选"。
+# 现在先取 SENTIMENT_COVERAGE_N 只确定性候选集，在集内全量补舆情后重排。
+SENTIMENT_COVERAGE_N = 60         # ≥ 5×top_n；为 0 表示对全池打分（请求量大，慎用）
+SENTIMENT_CACHE_TTL_SEC = 3600    # 同日重复扫描复用结果，避免反复请求上游
+
+# ========== 回测参数（规则3：手续费/滑点/滚动窗口）==========
+# 注意：backtest.py 已提供 point-in-time 存档与 purged walk-forward 骨架，
+#       但当前尚无历史截面面板，任何权重/阈值都不得声称为"回测优化结果"。
+COMMISSION = 0.00025
+COMMISSION_MIN = 5.0
+STAMP_TAX = 0.0005
+SLIPPAGE = 0.001
+TOP_N = 20
+TRAIN_DAYS = 120
+VALID_DAYS = 60
+OOS_DAYS = 60
+EMBARGO_DAYS = 5                  # 标签为 T+1~T+5 超额，窗口间需 5 日隔离防泄漏
+MIN_STATE_SAMPLES = 20            # 单状态每窗口至少 20 个截面，不足则回退基准权重

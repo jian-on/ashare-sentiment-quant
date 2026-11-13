@@ -12,6 +12,7 @@ market_sentiment.py — 模块四A：市场情绪温度计（实时，规则2的
 """
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 
 import akshare as ak
@@ -27,6 +28,11 @@ def _safe(fn, *a, **kw):
 
 def _score_from_counts(up, down, n_zt, n_zb) -> tuple[float, dict]:
     """由家数统计合成情绪分：涨跌比0.5 + 涨停强度0.3 + 炸板率惩罚0.2"""
+    # 2026-11-13 修复：全 0 时原式会算出 -0.3 的「偏空」值并被上层当成真实读数。
+    # 现在显式返回中性 0 并打降级标记，绝不静默伪装成有效观测。
+    if (up + down) == 0 and (n_zt + n_zb) == 0:
+        return 0.0, {"涨跌比": None, "涨停家数": n_zt, "炸板家数": n_zb,
+                     "炸板率": None, "数据质量": "DEGRADED: 无有效家数，返回中性0（非真实读数）"}
     breadth = (up - down) / (up + down) if (up + down) > 0 else 0.0
     zt_strength = min(n_zt / 100.0, 1.0)                     # 100家涨停记满分
     ban_rate = n_zb / (n_zb + n_zt) if (n_zb + n_zt) > 0 else None
@@ -60,23 +66,35 @@ def _from_spot(spot: pd.DataFrame) -> dict | None:
         ztp = pd.to_numeric(spot["涨停价"], errors="coerce")
         dtp = pd.to_numeric(spot["跌停价"], errors="coerce")
         high = pd.to_numeric(spot["最高"], errors="coerce")
-        is_zt = valid & (ztp > 0) & (px >= ztp * 0.999)
-        is_dt = valid & (dtp > 0) & (px <= dtp * 1.001)
-        touched = valid & (ztp > 0) & (high >= ztp * 0.999)
+        # 2026-11-13 修复：0.999/1.001 是比例容差，100元股容差 0.11 元、
+        # 200元股 0.22 元，会把「差几分钱没封住」误判为涨停。改用 1 个最小
+        # 报价单位（0.01 元）的绝对容差，与价格高低无关。
+        is_zt = valid & (ztp > 0) & ((px - ztp).abs() <= 0.01)
+        is_dt = valid & (dtp > 0) & ((px - dtp).abs() <= 0.01)
+        touched = valid & (ztp > 0) & (high >= ztp - 0.01)
         n_zt, n_dt = int(is_zt.sum()), int(is_dt.sum())
         n_zb = int((touched & ~is_zt).sum())
         exact = True
     else:
-        # 东财快照无涨停价字段 → 用 9.8% 近似（对主板10cm准确，20cm板会漏计，需明示）
-        n_zt = int((chg[valid] >= 9.8).sum())
-        n_dt = int((chg[valid] <= -9.8).sum())
-        n_zb = 0
+        # 东财备源快照无涨停价字段 → 按板块/ST 分别取涨跌幅阈值。
+        # 旧实现统一 9.8%：20cm 股涨 9.8%~20% 被误计为涨停，ST 5cm 涨停反而漏计。
+        code = spot["代码"].astype(str)
+        name = spot["名称"].astype(str) if "名称" in spot.columns else pd.Series("", index=spot.index)
+        is_20cm = code.str.startswith(("30", "688")).to_numpy()
+        is_st = name.str.contains("ST", na=False).to_numpy()
+        thr = np.where(is_20cm, 19.8, np.where(is_st, 4.8, 9.8))
+        v = valid.to_numpy()
+        n_zt = int(((chg.to_numpy() >= thr) & v).sum())
+        n_dt = int(((chg.to_numpy() <= -thr) & v).sum())
+        n_zb = 0        # 近似路径无「最高价触板」信息，炸板不计（宁缺勿造）
         exact = False
 
     score, detail = _score_from_counts(up, down, n_zt, n_zb)
     detail.update({"上涨": up, "下跌": down, "平盘": flat, "跌停家数": n_dt,
                    "market_score": score,
-                   "数据来源": "快照本地计算(涨停价精确判定)" if exact else "快照本地计算(9.8%近似)"})
+                   "数据来源": "快照本地计算(涨停价±0.01精确判定)" if exact
+                              else "快照本地计算(按板块10/20cm+ST 5cm近似, 炸板不计)",
+                   "数据质量": "OK" if exact else "APPROX: 无涨停价字段，涨跌停为阈值近似"})
     return {"market_score": score, "detail": detail}
 
 
@@ -86,14 +104,20 @@ def market_thermometer(spot: pd.DataFrame | None = None) -> dict:
     优先用全A快照本地计算（零请求）；快照不可用时才回退东财接口（4次请求）。
     """
     # ---- 主路径：快照本地计算，不发任何额外请求 ----
-    if spot is None:
+    from_cache = spot is None
+    if from_cache:
         try:
             import data_loader as dl
-            spot = dl._read_cache("spot", ttl_sec=3600)   # 允许1小时内的快照做温度计
+            # 允许 1 小时内的快照做收盘后复盘，但必须显式标注，避免与 60s 打分快照
+            # 被误认为同一截面（2026-11-13 审计：时点错配不可静默）
+            spot = dl._read_cache("spot", ttl_sec=3600)
         except Exception:
             spot = None
     r = _from_spot(spot)
     if r is not None:
+        if from_cache:
+            r["detail"]["数据质量"] = r["detail"].get("数据质量", "OK") + \
+                                    " | 使用最长1小时缓存快照（非打分快照同一时点）"
         return r
 
     # ---- 兜底：东财接口（仅在快照不可用时）----
@@ -101,6 +125,7 @@ def market_thermometer(spot: pd.DataFrame | None = None) -> dict:
     detail = {}
     if SRC.blocked_remain("em") > 0:
         detail["说明"] = f"无可用快照，东财冷却中（还需{SRC.blocked_remain('em'):.0f}秒），返回中性值"
+        detail["数据质量"] = "DEGRADED: 无有效数据，中性0非真实读数"
         return {"market_score": 0.0, "detail": detail}
 
     up, down = 0.0, 0.0
@@ -121,6 +146,8 @@ def market_thermometer(spot: pd.DataFrame | None = None) -> dict:
     score, extra = _score_from_counts(up, down, n_zt, n_zb)
     detail.update(extra)
     detail.update({"跌停家数": n_dt, "market_score": score, "数据来源": "东财接口"})
+    if "数据质量" not in detail:
+        detail["数据质量"] = "OK"
     return {"market_score": score, "detail": detail}
 
 

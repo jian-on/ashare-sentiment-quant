@@ -174,6 +174,9 @@ def _parse_tx_batch(text: str) -> list[dict]:
             out.append({
                 "代码": code,
                 "名称": name,
+                # 2026-11-13 新增：腾讯字段 30 是行情时间（如 20261113150000）。
+                # 零成本带上 asof，供上层做 point-in-time 校验与截面一致性检查。
+                "asof": str(f[30]) if len(f) > 30 else None,
                 "最新价": num(3),
                 "涨跌幅": num(32),
                 "成交额": (num(37) or 0) * 1e4,   # 万元 → 元，与东财口径统一

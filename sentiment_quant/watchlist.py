@@ -33,7 +33,7 @@ def analyze_watchlist(codes: list[str], with_sentiment: bool = True) -> dict:
     spot = dl.get_spot()
 
     # ---- 市场情绪温度计（一次）----
-    thermo = MS.market_thermometer()
+    thermo = MS.market_thermometer(spot=spot)   # 与打分同一份快照，避免截面时点错配
     print(f"[市场温度] market_score={thermo['market_score']} 涨停={thermo['detail'].get('涨停家数')} "
           f"炸板率={thermo['detail'].get('炸板率')}")
 

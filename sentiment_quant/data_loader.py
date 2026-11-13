@@ -20,6 +20,7 @@ data_loader.py — 模块一：标的过滤 + 前复权行情（项目工作顺�
 import os
 import time
 import hashlib
+import numpy as np
 import pandas as pd
 
 import config as C
@@ -155,12 +156,16 @@ def filter_universe(spot: pd.DataFrame) -> pd.DataFrame:
     df = spot.copy()
     n0 = len(df)
 
-    # 1) 代码前缀过滤（688=科创板 / 4、8、9开头=北交所老代码等）
+    # 1) 代码前缀过滤（4、8、9开头=北交所，不在白名单内即剔除）
+    #    2026-11-13 修复：原实现只认 ("60","00") + 可选 688，
+    #    创业板 300/301 被静默全部剔除，实盘板块分布里创业板数量为 0。
     code = df["代码"].astype(str)
-    mask_prefix = code.str.startswith(("60", "00"))  # 沪深主板
+    prefixes = ["60", "00"]
+    if C.INCLUDE_CHINEXT:
+        prefixes.append("30")       # 创业板 300/301（20cm，混池风险已在 README 标注）
     if not C.EXCLUDE_688:
-        mask_prefix |= code.str.startswith("688")
-    df = df[mask_prefix]
+        prefixes.append("688")      # 科创板（20cm）
+    df = df[code.str.startswith(tuple(prefixes))]
     n1 = len(df)
 
     # 2) ST/退市
@@ -177,13 +182,15 @@ def filter_universe(spot: pd.DataFrame) -> pd.DataFrame:
     df = df[df["成交额"] >= C.MIN_AMOUNT]
     n4 = len(df)
 
-    # 5) 次新粗筛：60日涨跌幅为空说明上市不足60日
+    # 5) 次新粗筛：腾讯批量快照不返回「60日涨跌幅」，该列恒缺，此步在腾讯主源下不生效。
+    #    真正的次新剔除在 build_stock_pool 按实际K线根数完成（MIN_LISTED_DAYS+5）。
+    #    保留列检查仅为兼容未来提供该字段的数据源，不再对外宣称已完成过滤。
     if "60日涨跌幅" in df.columns:
         df = df[df["60日涨跌幅"].notna()]
     n5 = len(df)
 
     print(f"[标的过滤] 全A {n0} -> 板块 {n1} -> 剔ST {n2} -> 剔停牌 {n3} "
-          f"-> 剔低流动性 {n4} -> 剔次新粗筛 {n5}")
+          f"-> 剔低流动性 {n4} -> 可选次新粗筛 {n5}（次新精筛在K线层）")
     return df.reset_index(drop=True)
 
 
@@ -251,10 +258,18 @@ def fetch_hist(symbol: str, days: int = None) -> pd.DataFrame | None:
                 print(f"[fetch_hist {symbol}] 两源均失败，降级返回过期K线")
                 return old
             raise RateLimited(f"K线两源均失败（腾讯 + 东财限流，于{symbol}），已进入冷却") from e
-        print(f"[行情获取失败 {symbol}] {type(e).__name__}: {e}（规则7：不造数据，跳过并记录）")
-        return old if old is not None else None
+        # 2026-11-13 修复：原实现在此无条件 return old（可能是 11 天前的缓存），
+        # 绕过 ALLOW_STALE_FALLBACK 且无任何标记，上层会把过期K线当实时数据打分。
+        print(f"[行情获取失败 {symbol}] {type(e).__name__}: {e}")
+        if C.ALLOW_STALE_FALLBACK and old is not None:
+            print(f"[fetch_hist {symbol}] 严格实时已关闭，显式降级返回过期K线")
+            return old
+        return None
     if raw is None or raw.empty:
-        return old if old is not None else None
+        if C.ALLOW_STALE_FALLBACK and old is not None:
+            print(f"[fetch_hist {symbol}] 严格实时已关闭，显式降级返回过期K线")
+            return old
+        return None
 
     new = _normalize_hist(raw)
     if old is not None and not old.empty:
@@ -269,12 +284,37 @@ def fetch_hist(symbol: str, days: int = None) -> pd.DataFrame | None:
 
 def build_stock_pool(spot: pd.DataFrame, max_pool: int = 300) -> dict[str, pd.DataFrame]:
     """
-    粗筛后的候选池按成交额降序取前 max_pool 只，并发拉前复权K线。
-    性能：8 线程并发，150 只约 2-4 秒（旧版东财逐只 0.5s 节流需 75 秒且会被封）。
+    候选池选样（2026-11-13 修订）+ 并发拉前复权K线。
+    - 默认 "stratified"：按当日成交额分位分 5 层等额抽样，固定随机种子可复现。
+      原「成交额降序 Top N」会把中小盘题材股系统性挤出，实盘基线 Top10 全是
+      大盘蓝筹，与题材短线主线冲突；分层抽样让各市值层都有代表。
+    - "top_amount"：保留旧行为，但存在「用当日结果选样 + 用当日结果打分」的自我指涉偏差。
+    性能：4 线程并发，120 只约 4 秒。
     精筛：K线不足 MIN_LISTED_DAYS+5 根的视为次新/数据异常，剔除。
     返回 {code: qfq_df}
     """
-    pool = spot.sort_values("成交额", ascending=False).head(max_pool)
+    if C.POOL_SELECT_MODE == "stratified" and len(spot) > max_pool:
+        amt = pd.to_numeric(spot["成交额"], errors="coerce").reset_index(drop=True)
+        strata = pd.qcut(amt.rank(method="first"), C.POOL_STRATA, labels=False).to_numpy()
+        rng = np.random.default_rng(C.POOL_RANDOM_SEED)
+        per = max_pool // C.POOL_STRATA
+        picked: list[int] = []
+        for g in range(C.POOL_STRATA):
+            members = np.flatnonzero(strata == g)
+            if len(members):
+                chosen = rng.choice(members, size=min(per, len(members)), replace=False)
+                picked.extend(int(x) for x in chosen)
+        taken = set(picked)
+        remain = [i for i in range(len(spot)) if i not in taken]
+        if len(picked) < max_pool and remain:
+            extra = rng.choice(remain, size=min(max_pool - len(picked), len(remain)), replace=False)
+            picked.extend(int(x) for x in extra)
+        pool = spot.iloc[picked[:max_pool]]
+        print(f"[选池] 成交额分 {C.POOL_STRATA} 层等额抽样 "
+              f"(seed={C.POOL_RANDOM_SEED}) -> {len(pool)} 只")
+    else:
+        pool = spot.sort_values("成交额", ascending=False).head(max_pool)
+        print(f"[选池] 成交额降序 Top{max_pool}（旧口径，存在当日结果选样偏差）")
     codes = [str(c) for c in pool["代码"].tolist()]
 
     result: dict[str, pd.DataFrame] = {}
@@ -294,6 +334,10 @@ def build_stock_pool(spot: pd.DataFrame, max_pool: int = 300) -> dict[str, pd.Da
                               f"期间请勿重复点击") from e
         if not fetched and need:
             raise RuntimeError(f"腾讯K线全部失败（{len(need)}只），请运行 python sources.py --debug 排查")
+        if len(fetched) < len(need) * 0.7:
+            # 部分失败会静默缩小横截面，winsorize_z 在残缺池上重算 → z 失真
+            print(f"[警告] K线覆盖率仅 {len(fetched)}/{len(need)} "
+                  f"({len(fetched)/len(need):.0%})，本次横截面 z 分数可能失真，排序结果不宜采信")
         dropped = []
         for code, df in fetched.items():
             if len(df) < C.MIN_LISTED_DAYS + 5:
