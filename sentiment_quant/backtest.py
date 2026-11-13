@@ -10,6 +10,7 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
 本模块做三件事：
   1. archive  — 每次运行把当日完整横截面（因子 z、composite、状态、舆情源）落盘为不可变快照
   2. label    — T+5 之后用项目自有腾讯K线补未来 5 日超额收益标签（不依赖付费 API）
+               买入口径为 T+1 开盘（清单 T 日收盘后才生成），T+1 一字涨停剔除
   3. report   — 按时序切 TRAIN/VALID/OOS + 5日 embargo，输出 Rank IC / ICIR 与扣费净超额
 
 ⚠️ 诚实边界：需要积累 ≥ TRAIN+VALID+OOS+EMBARGO = 245 个交易日截面才有统计意义。
@@ -17,10 +18,14 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
    阈值/权重的定参只允许在 TRAIN+VALID 做，OOS 只看一次即冻结。
 
 用法：
+  python backtest.py --daily              # ★盘后一站式：交易日判定→存档→补标签→状态（定时任务用）
   python backtest.py --archive            # 收盘后运行，存档当日横截面
   python backtest.py --label 20261113     # 该日 T+5 过后补标签
+  python backtest.py --label-pending      # 扫描并补齐所有可补标签的存档
   python backtest.py --status             # 查看数据准备度
   python backtest.py --report             # 出样本外报告（数据不足会明确拒绝）
+
+日志：data_cache/pit/daily_run.log（追加，UTF-8；目录已被 .gitignore 排除）
 """
 import argparse
 import datetime as dt
@@ -40,11 +45,27 @@ import regime as RG
 import sources as SRC
 
 PIT_DIR = os.path.join(C.CACHE_DIR, "pit")
+LOG_PATH = os.path.join(PIT_DIR, "daily_run.log")
 REQUIRED_DAYS = C.TRAIN_DAYS + C.VALID_DAYS + C.OOS_DAYS + C.EMBARGO_DAYS
+# 一字涨停买不到、K线缺失都会让个别标的没有标签。用覆盖率而非「全部非空」
+# 判定某日是否已完成标注，否则只要有一只缺失就会永远 pending、每天重复拉取。
+LABEL_COVERAGE_MIN = 0.80
 
 
 def _ensure_dir():
     os.makedirs(PIT_DIR, exist_ok=True)
+
+
+def _log(msg: str):
+    """同时输出到 stdout（供定时任务采集）与盘后日志（供事后排查）"""
+    line = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line, flush=True)
+    try:
+        _ensure_dir()
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def _path(date_str: str) -> str:
@@ -61,7 +82,7 @@ def archive_cross_section(date_str: str | None = None, pool_size: int = 300) -> 
     date_str = date_str or dt.date.today().strftime("%Y%m%d")
     path = _path(date_str)
     if os.path.exists(path):
-        print(f"[存档] {date_str} 已存在，跳过（不可变）：{path}")
+        _log(f"[存档] {date_str} 已存在，跳过（不可变）：{path}")
         return path
 
     asof = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -91,7 +112,7 @@ def archive_cross_section(date_str: str | None = None, pool_size: int = 300) -> 
     df["fwd_ret_5d"] = np.nan        # 标签位，T+5 后由 label 填充
     df["fwd_excess_5d"] = np.nan
     df.to_parquet(path, index=False)
-    print(f"[存档] {date_str} 已写入 {len(df)} 只 / asof {asof} / 状态 {state} -> {path}")
+    _log(f"[存档] {date_str} 已写入 {len(df)} 只 / asof {asof} / 状态 {state} -> {path}")
     return path
 
 
@@ -106,17 +127,19 @@ def label_forward_returns(date_str: str, horizon: int = 5) -> int:
     if not os.path.exists(path):
         raise FileNotFoundError(f"无 {date_str} 存档，请先 --archive")
     df = pd.read_parquet(path)
-    if df["fwd_excess_5d"].notna().all():
-        print(f"[标签] {date_str} 已完成，跳过")
+    if len(df) and df["fwd_excess_5d"].notna().mean() >= LABEL_COVERAGE_MIN:
+        _log(f"[标签] {date_str} 已完成，跳过")
         return 0
 
     t0 = pd.to_datetime(date_str, format="%Y%m%d")
     rets = {}
+    n_unbuyable = 0
     for code in df["code"].astype(str):
         hist = SRC.fetch_kline_tx(code, days=30)
         if hist is None or hist.empty:
             continue
-        h = hist.copy()
+        # 必须重置为连续整数索引：下面用 i+horizon 定位 T+5，索引不连续会取错行
+        h = hist.copy().reset_index(drop=True)
         h["date"] = pd.to_datetime(h["date"])
         pos = h.index[h["date"] >= t0]
         if len(pos) == 0:
@@ -124,20 +147,33 @@ def label_forward_returns(date_str: str, horizon: int = 5) -> int:
         i = pos[0]
         if i + horizon >= len(h):
             continue
-        c0 = float(h.loc[i, "close"])
-        c1 = float(h.loc[i + horizon, "close"])
-        if c0 > 0:
-            rets[code] = c1 / c0 - 1
+        # 可执行口径：清单在 T 日收盘后才生成 → 最早 T+1 开盘买入。
+        # 用 T 日收盘价当成本等于假设能回到过去成交，会系统性高估收益。
+        # 停牌日不在K线里，i+1 自然落到下一个可交易日开盘，符合实际。
+        prev_close = float(h.loc[i, "close"])
+        buy_row = h.loc[i + 1]
+        buy = float(buy_row["open"])
+        sell = float(h.loc[i + horizon, "close"])
+        if buy <= 0 or prev_close <= 0:
+            continue
+        # T+1 一字涨停开盘（无振幅）实际买不到，剔除而非假装成交
+        limit = 0.198 if str(code).startswith(("300", "301", "688")) else 0.098
+        if (float(buy_row["high"]) == float(buy_row["low"])
+                and buy / prev_close - 1 >= limit - 0.005):
+            n_unbuyable += 1
+            continue
+        rets[code] = sell / buy - 1
 
-    if len(rets) < max(10, int(len(df) * 0.6)):
-        print(f"[标签] {date_str} 仅取到 {len(rets)}/{len(df)} 只，"
-              f"T+{horizon} 可能尚未到来，保持 pending")
+    if len(rets) < max(10, int(len(df) * LABEL_COVERAGE_MIN)):
+        _log(f"[标签] {date_str} 仅取到 {len(rets)}/{len(df)} 只，"
+             f"T+{horizon} 可能尚未到来，保持 pending")
         return 0
     bench = float(np.mean(list(rets.values())))
     df["fwd_ret_5d"] = df["code"].astype(str).map(rets)
     df["fwd_excess_5d"] = df["fwd_ret_5d"] - bench
     df.to_parquet(path, index=False)
-    print(f"[标签] {date_str} 完成 {len(rets)} 只 / 基准收益 {bench:+.4f}")
+    _log(f"[标签] {date_str} 完成 {len(rets)} 只 / 一字涨停剔除 {n_unbuyable} 只"
+         f" / 基准收益 {bench:+.4f}（T+1开盘买 → T+{horizon}收盘卖）")
     return len(rets)
 
 
@@ -168,11 +204,9 @@ def _net_excess(seg: pd.DataFrame, top_n: int) -> dict:
     """Top N 等权的扣费净超额（对齐横截面排序目标，非绝对收益）"""
     vals = []
     for _, g in seg.groupby("date"):
-        if g["fwd_excess_5d"].isna().any():
-            continue
         top = g.nlargest(min(top_n, len(g)), "composite")
-        if len(top) == 0:
-            continue
+        if len(top) == 0 or top["fwd_excess_5d"].notna().mean() < LABEL_COVERAGE_MIN:
+            continue                       # Top 名单标签覆盖不足，该日不参与净超额统计
         gross = float(top["fwd_excess_5d"].mean())
         # 买入+卖出各一次：佣金/滑点双边，印花税卖出单边
         cost = 2 * (C.COMMISSION + C.SLIPPAGE) + C.STAMP_TAX
@@ -192,10 +226,100 @@ def load_panel() -> pd.DataFrame:
                      ignore_index=True).sort_values("date").reset_index(drop=True)
 
 
+# ------------------------------------------------- 4. 盘后无人值守流水线
+def spot_trading_day(spot: pd.DataFrame) -> tuple[bool, str | None]:
+    """
+    用腾讯快照字段 30 的行情日期众数判定「今天是不是交易日」。
+
+    为什么必须判：周末/节假日腾讯仍返回上一交易日快照，若直接用
+    date.today() 作存档日期，会把同一份截面存成多个日期，制造重复样本、
+    虚增面板天数，最终让 walk-forward 的统计显著性完全失真。
+    解析不出来一律返回 False（宁可漏存一天，绝不存错截面）。
+    """
+    if spot is None or len(spot) == 0 or "asof" not in spot.columns:
+        return False, None
+    days = spot["asof"].astype(str).str[:8]
+    days = days[days.str.fullmatch(r"\d{8}", na=False)]
+    if days.empty:
+        return False, None
+    mode_day = str(days.mode().iloc[0])
+    return mode_day == dt.date.today().strftime("%Y%m%d"), mode_day
+
+
+def label_pending(min_age_days: int = 5) -> int:
+    """
+    扫描 PIT 存档，把所有「T+5 已过但尚未补标签」的日期补齐，幂等。
+    交给脚本自己判断 T+5 是否真的到来（数据不够会保持 pending，次日再试），
+    这样定时任务不必推算交易日历，法定长假也不会漏补。
+    """
+    _ensure_dir()
+    today = dt.date.today()
+    done = 0
+    for fn in sorted(f for f in os.listdir(PIT_DIR) if f.endswith(".parquet")):
+        date_str = fn[:-len(".parquet")]
+        try:
+            d = dt.datetime.strptime(date_str, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if (today - d).days < min_age_days:
+            continue
+        path = os.path.join(PIT_DIR, fn)
+        try:
+            col = pd.read_parquet(path, columns=["fwd_excess_5d"])["fwd_excess_5d"]
+        except Exception as e:
+            _log(f"[标签] {date_str} 读取失败：{type(e).__name__}: {e}")
+            continue
+        if len(col) and col.notna().mean() >= LABEL_COVERAGE_MIN:
+            continue                       # 已完成，幂等跳过
+        try:
+            n = label_forward_returns(date_str)
+            if n:
+                done += 1
+                _log(f"[标签] {date_str} 补齐 {n} 只")
+        except Exception as e:
+            _log(f"[标签] {date_str} 失败：{type(e).__name__}: {e}")
+    return done
+
+
+def daily_run(pool_size: int = 300) -> int:
+    """定时任务唯一入口：交易日判定 → 存档 → 补标签 → 状态。返回进程退出码。"""
+    today = dt.date.today().strftime("%Y%m%d")
+    _log(f"=== daily_run 开始 {today} ===")
+    failed = False
+    try:
+        spot = dl.get_spot()
+    except Exception as e:
+        _log(f"[存档] 行情快照获取失败，跳过当日存档：{type(e).__name__}: {e}")
+        spot = None
+        failed = True
+
+    if spot is not None:
+        is_td, mode_day = spot_trading_day(spot)
+        if is_td:
+            try:
+                archive_cross_section(today, pool_size=pool_size)
+            except Exception as e:
+                _log(f"[存档] {today} 失败：{type(e).__name__}: {e}")
+                failed = True
+        else:
+            _log(f"[存档] 今日非交易日（快照行情日 {mode_day or '无法解析'} ≠ {today}），"
+                 f"跳过存档，避免重复截面")
+
+    n = label_pending()                     # 休市日同样可补标签
+    st = status()
+    _log("[状态] " + json.dumps(st, ensure_ascii=False))
+    if not st["ready"]:
+        _log(f"[结论] 数据不足（{st['已补标签天数']}/{st['需要天数']} 个已标注交易日），"
+             f"拒绝给出任何有效性结论；本次仅完成存档与标签补齐")
+    _log(f"=== daily_run 结束 | 标签补齐 {n} 天 | 失败={'是' if failed else '否'} ===")
+    return 1 if failed else 0
+
+
 def status() -> dict:
     p = load_panel()
     dates = sorted(p["date"].unique()) if len(p) else []
-    labeled = int(p.groupby("date")["fwd_excess_5d"].apply(lambda s: s.notna().all()).sum()) if dates else 0
+    labeled = int(p.groupby("date")["fwd_excess_5d"]
+                  .apply(lambda s: s.notna().mean() >= LABEL_COVERAGE_MIN).sum()) if dates else 0
     return {"存档天数": len(dates), "已补标签天数": labeled,
             "需要天数": REQUIRED_DAYS,
             "最早": dates[0] if dates else None, "最新": dates[-1] if dates else None,
@@ -256,17 +380,23 @@ def report() -> dict:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--daily", action="store_true", help="盘后一站式（定时任务用）")
     ap.add_argument("--archive", action="store_true", help="存档当日横截面")
     ap.add_argument("--label", metavar="YYYYMMDD", help="补未来5日收益标签")
+    ap.add_argument("--label-pending", action="store_true", help="补齐所有可补标签")
     ap.add_argument("--status", action="store_true", help="查看数据准备度")
     ap.add_argument("--report", action="store_true", help="样本外报告")
     ap.add_argument("--pool", type=int, default=300)
     a = ap.parse_args()
+    if a.daily:
+        raise SystemExit(daily_run(pool_size=a.pool))
     if a.archive:
         archive_cross_section(pool_size=a.pool)
     if a.label:
         label_forward_returns(a.label)
-    if a.status or not any([a.archive, a.label, a.report]):
+    if a.label_pending:
+        label_pending()
+    if a.status or not any([a.archive, a.label, a.label_pending, a.report]):
         print(json.dumps(status(), ensure_ascii=False, indent=2))
     if a.report:
         print(json.dumps(report(), ensure_ascii=False, indent=2))

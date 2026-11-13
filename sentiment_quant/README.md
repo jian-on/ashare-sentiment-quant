@@ -23,7 +23,7 @@
 | **regime.py** | 情绪四态判定 + 自适应权重（**实验性，默认关闭，未验证**） | ⚠️ 待样本外检验 |
 | watchlist.py | 自选股全面分析（四路数据融合） | ✅ 已烟测 |
 | recommend.py | 横截面因子排序观测（舆情前置到候选集） | ✅ 已回归 |
-| **backtest.py** | point-in-time 存档 + purged walk-forward（IC/ICIR/扣费净超额） | ⚠️ 骨架就位，待 245 日数据 |
+| **backtest.py** | point-in-time 存档 + purged walk-forward（IC/ICIR/扣费净超额）；`--daily` 盘后一站式 | ⚠️ 已接入定时任务，待 245 日数据 |
 | make_launcher.py | 生成桌面/项目内双击启动器（GBK 编码写 .bat） | ✅ |
 | app.py | Streamlit 单页面观测终端 | ✅ |
 | **RESEARCH_2026-11-13.md** | 多智能体审计与优化报告（含已修 bug / 待验证假设 / 遗留问题） | 📄 |
@@ -74,11 +74,20 @@ $PY recommend.py --top 10 --pool 120   # 横截面排序观测
 $PY make_launcher.py          # 重新生成启动器
 
 # 每日收盘后积累 point-in-time 存档（回测证据的唯一来源）
-$PY backtest.py --archive                 # 存档当日横截面
-$PY backtest.py --label 20261106         # 补 5 个交易日前的收益标签
+# ★ 已配置定时任务：交易日 15:50 自动执行下面第一条，无需人工干预
+$PY backtest.py --daily                   # 交易日判定 → 存档 → 补标签 → 状态（一站式）
+$PY backtest.py --label-pending           # 只补齐所有可补标签（幂等，可重复跑）
 $PY backtest.py --status                  # 查看数据准备度（需 245 日）
 $PY backtest.py --report                  # 样本外报告（数据不足会明确拒绝）
+# 手动补档（正常不需要）：$PY backtest.py --archive / --label 20261106
 ```
+
+**盘后流水线口径**（2026-11-13 定死，改动会导致存量样本全部作废）：
+- 存档落在 `data_cache/pit/YYYYMMDD.parquet`，**不可变**，日志 `data_cache/pit/daily_run.log`（均被 `.gitignore` 排除）。
+- `--daily` 用腾讯快照行情日期判定交易日：休市日**跳过存档**，绝不把上一交易日快照按新日期存成重复截面；补标签在休市日照常执行。
+- 标签口径：清单 T 日收盘后才生成 → **T+1 开盘买入、T+5 收盘卖出**。用 T 日收盘价当成本等于假设能回到过去成交，会系统性高估收益。
+- T+1 一字涨停（主板 10cm / 创业板科创板 20cm 分别判定）视为买不到，剔除而非假装成交；单日标签覆盖率 ≥80% 才计为已标注。
+- 补标签由脚本扫描存档自行判断 T+5 是否到来，**不需要人工推算交易日历**，法定长假不会漏补。
 
 ## 通义千问接入
 ```bash
@@ -96,9 +105,11 @@ export DASHSCOPE_API_KEY=sk-xxxx    # Windows CMD: set DASHSCOPE_API_KEY=sk-xxxx
    舆情现以个股新闻为主。调试方案见 sentiment.py 末尾注释。
 4. `stock_news_em` 与 pandas 3.0 不兼容（pyarrow 拒绝 `\u3000` 正则）→ 已改 requests 直连上游。
 5. **舆情新闻无时点过滤**：`sort=default` 单页 ≤50 条，未用 `time` 字段做旧闻过滤/衰减。
-   实时观测尚可，一旦做历史回测即构成 look-ahead —— 开启 `backtest.py` 前必须先按发布日期落库。
-6. **盘中未收盘 K 线**：腾讯日K末根是盘中动态值；收盘后运行无影响，盘中会让因子随价格漂移，
-   且回测用收盘价 → 口径不一致。建议只在收盘后 `--archive`。
+   需区分两件事：**实时 PIT 存档不构成 look-ahead**（抓取时刻即 T 日 15:50，不可能有未来新闻），
+   但旧闻混入会稀释短线情绪信号；**历史重放才构成 look-ahead**，因此严禁用当前新闻去补历史日期的
+   `--archive`。彻底修复需按发布日期落库并做时间衰减。
+6. **盘中未收盘 K 线**：腾讯日K末根是盘中动态值；定时任务固定在收盘后 15:50 运行，无此问题。
+   但手动在盘中执行 `--archive` 仍会让因子随价格漂移且与回测口径不一致，**禁止**。
 7. **20cm / 10cm 混池**：创业板与科创板纳入后涨跌幅限制不同，需在回测里按板块分层检验。
 8. **样本外证据为 0**：所有权重、状态阈值均未回测。`backtest.py --report` 在攒够 245 个
    已标注交易日前会直接返回 `INSUFFICIENT_DATA`，拒绝给结论。
