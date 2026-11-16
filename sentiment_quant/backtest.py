@@ -21,8 +21,14 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
 收盘闸门（2026-11-16）：早于 ARCHIVE_MIN_HHMM 一律拒绝写 PIT 存档，防止盘中
 未定型日K被固化进不可变截面。定时任务固定 15:50，正常路径不受影响；补标签不受闸门限制。
 
-⚠️ 诚实边界：需要积累 ≥ TRAIN+VALID+OOS+EMBARGO = 245 个交易日截面才有统计意义。
-   数据不足时本模块**拒绝给出任何结论**，只报告 INSUFFICIENT_DATA。
+⚠️ 诚实边界（两级口径，2026-11-16）：
+   · 探索期 ≥30 个已标注交易日 → `report(preview=True)` 只给描述性诊断，
+     verdict=EXPLORATORY_ONLY，不判 PASS/FAIL、不据此调权。
+   · 验证期 ≥TRAIN+VALID+OOS+EMBARGO=245 个已标注交易日 → 正式 walk-forward，
+     才给出唯一可宣称有效的 PASS/FAIL 判定。
+   不能把 245 简单改成 30：30 日扣隔离与未成熟标签后不足 20 个截面，
+   t=0.30*sqrt(20)≈1.34 永远达不到 p<0.05，验证会退化成必然失败的假证据。
+   数据不足时本模块**拒绝给出有效性结论**，只报告 INSUFFICIENT_DATA。
    阈值/权重的定参只允许在 TRAIN+VALID 做，OOS 只看一次即冻结。
 
 用法：
@@ -30,9 +36,10 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
   python backtest.py --archive            # 收盘后运行，存档当日横截面
   python backtest.py --label 20261113     # 该日 T+5 过后补标签
   python backtest.py --label-pending      # 扫描并补齐所有可补标签的存档
-  python backtest.py --status             # 查看数据准备度
+  python backtest.py --status             # 查看数据准备度（探索期/验证期两级）
   python backtest.py --quality [N]        # 最近 N 日数据质量摘要（默认 5）
-  python backtest.py --report             # 出样本外报告（数据不足会明确拒绝）
+  python backtest.py --report             # 正式样本外报告（需 245 日，不足明确拒绝）
+  python backtest.py --report --preview   # 30 日探索性诊断（EXPLORATORY_ONLY，非正式结论）
 
 日志：data_cache/pit/daily_run.log（追加，UTF-8；目录已被 .gitignore 排除）
 """
@@ -57,6 +64,8 @@ import sources as SRC
 PIT_DIR = os.path.join(C.CACHE_DIR, "pit")
 LOG_PATH = os.path.join(PIT_DIR, "daily_run.log")
 REQUIRED_DAYS = C.TRAIN_DAYS + C.VALID_DAYS + C.OOS_DAYS + C.EMBARGO_DAYS
+# 探索期门槛：只出描述性诊断，不给有效性判定。与正式 OOS 重叠，不得当独立证据。
+EXPLORATORY_REQUIRED_DAYS = C.EXPLORATORY_DAYS
 # 一字涨停买不到、K线缺失都会让个别标的没有标签。用覆盖率而非「全部非空」
 # 判定某日是否已完成标注，否则只要有一只缺失就会永远 pending、每天重复拉取。
 LABEL_COVERAGE_MIN = 0.80
@@ -474,8 +483,14 @@ def daily_run(pool_size: int = 300) -> int:
     except Exception as e:
         _log(f"[质量] 摘要生成失败（不影响存档与补标签）：{type(e).__name__}: {e}")
     if not st["ready"]:
-        _log(f"[结论] 数据不足（{st['已补标签天数']}/{st['需要天数']} 个已标注交易日），"
-             f"拒绝给出任何有效性结论；本次仅完成存档与标签补齐")
+        if st["探索期ready"]:
+            _log(f"[结论] 验证期未到（{st['已补标签天数']}/{st['需要天数']}），拒绝有效性结论；"
+                 f"探索期已满，可用 --report --preview 查看描述性诊断"
+                 f"（EXPLORATORY_ONLY，不得据此调权）")
+        else:
+            _log(f"[结论] 数据不足（{st['已补标签天数']}/{st['需要天数']} 个已标注交易日，"
+                 f"探索期需 {st['探索期需要天数']}），拒绝给出任何有效性结论；"
+                 f"本次仅完成存档与标签补齐")
     _log(f"=== daily_run 结束 | 标签补齐 {n} 天 | 失败={'是' if failed else '否'} ===")
     return 1 if failed else 0
 
@@ -489,6 +504,10 @@ def status() -> dict:
         if dates and "fwd_excess_mkt_5d" in p.columns else 0
     return {"存档天数": len(dates), "已补标签天数": labeled,
             "需要天数": REQUIRED_DAYS,
+            "探索期需要天数": EXPLORATORY_REQUIRED_DAYS,
+            "探索期ready": labeled >= EXPLORATORY_REQUIRED_DAYS,
+            "距离探索期": max(0, EXPLORATORY_REQUIRED_DAYS - labeled),
+            "距离验证期": max(0, REQUIRED_DAYS - labeled),
             "最早": dates[0] if dates else None, "最新": dates[-1] if dates else None,
             "ready": labeled >= REQUIRED_DAYS}
 
@@ -530,11 +549,78 @@ def quality_summary(days: int = 5) -> dict:
     return {"n_days": len(out), "recent": out, "alerts": alerts[:20]}
 
 
-def report() -> dict:
+def exploratory_report() -> dict:
+    """30 个已标注交易日的描述性诊断（独立分支，不复用正式分段与判定）。
+
+    为什么不硬切 TRAIN/VALID/OOS：30 日扣 embargo 与未成熟标签后不足 20 个截面，
+    三段各只有个位数，定参与评价都无意义；更糟的是套用 ICIR>=0.30 且 p<0.05 时
+    t=0.30*sqrt(20)≈1.34 永不可能达标，会把验证退化成「必然失败」的假证据。
+    因此本分支只输出 IC / 净超额 / 分层的描述性读数，verdict 固定 EXPLORATORY_ONLY，
+    不评估任何阈值、不给 PASS/FAIL、不据此调权。
+    """
+    st = status()
+    if not st["探索期ready"]:
+        return {"verdict": "INSUFFICIENT_DATA", "stage": "EXPLORATORY",
+                "reason": (f"探索期需 ≥{EXPLORATORY_REQUIRED_DAYS} 个已标注交易日，"
+                           f"当前仅 {st['已补标签天数']} 个；不给描述性以外的结论"), **st}
+    p = load_panel()
+    need = ["fwd_excess_5d", "fwd_excess_mkt_5d", "pool_ret_5d", "mkt_ret_5d"]
+    missing = [c for c in need if c not in p.columns]
+    if missing:
+        return {"verdict": "SCHEMA_MISMATCH", "stage": "EXPLORATORY",
+                "reason": f"面板缺少 {missing}；请用当前代码重新标注后再诊断", **st}
+    p = p[p["fwd_excess_5d"].notna() & p["fwd_excess_mkt_5d"].notna()].copy()
+    dates = sorted(p["date"].unique())[-EXPLORATORY_REQUIRED_DAYS:]
+    if len(dates) < EXPLORATORY_REQUIRED_DAYS:
+        return {"verdict": "INSUFFICIENT_DATA", "stage": "EXPLORATORY",
+                "reason": (f"可用标签截面仅 {len(dates)} 个，"
+                           f"不足 {EXPLORATORY_REQUIRED_DAYS}"), **st}
+    seg = p[p["date"].isin(dates)]
+    ics = [_rank_ic(g["composite"], g["fwd_excess_5d"]) for _, g in seg.groupby("date")]
+    out = {
+        "verdict": "EXPLORATORY_ONLY",
+        "stage": "EXPLORATORY",
+        "window": {"days": len(dates), "start": dates[0], "end": dates[-1]},
+        "diagnostics": {**_ic_stats(ics), **_net_excess(seg, C.TOP_N)},
+        "thresholds_evaluated": False,
+        "caveats": [
+            "本诊断只有描述性意义，不构成样本外有效性证据；不得据此调权或宣称模型有效",
+            f"窗口仅 {len(dates)} 个截面，ICIR/p 值统计效力极弱；"
+            "正式门槛 ICIR>=0.30 且 p<0.05 在此样本量下无意义，故未评估",
+            "本探索窗口与正式 OOS 重叠，不能作为独立证据；唯一有效性结论仍需 "
+            f"{REQUIRED_DAYS} 个已标注交易日的正式 walk-forward",
+        ],
+        "benchmark": {"symbol": C.BENCHMARK_SYMBOL, "label": C.BENCHMARK_LABEL},
+        **st,
+    }
+    # 分层只做描述，样本不足时标注，绝不参与判定或自动调权
+    out["state_layered_ic"] = {}
+    for state, g in seg.groupby("state"):
+        s = _ic_stats([_rank_ic(x["composite"], x["fwd_excess_5d"])
+                       for _, x in g.groupby("date")])
+        if s["n"] < C.MIN_STATE_SAMPLES:
+            s["note"] = f"样本 <{C.MIN_STATE_SAMPLES}，仅描述，不定参"
+        out["state_layered_ic"][str(state)] = s
+    if "board" in p.columns:
+        out["board_layered_ic"] = {}
+        for board, g in seg.groupby("board"):
+            s = _ic_stats([_rank_ic(x["composite"], x["fwd_excess_5d"])
+                           for _, x in g.groupby("date")])
+            if s["n"] < C.MIN_BOARD_SAMPLES:
+                s["note"] = f"样本 <{C.MIN_BOARD_SAMPLES}，仅描述，不定参"
+            out["board_layered_ic"][str(board)] = s
+    return out
+
+
+def report(preview: bool = False) -> dict:
     """
     时序 purged walk-forward：TRAIN / VALID / OOS，段间 5 日 embargo 防标签重叠泄漏。
     OOS 只用于最终判定，不参与任何阈值或权重调整。
+
+    preview=True 走 30 日探索性诊断分支：只描述、不判定、不调权。
     """
+    if preview:
+        return exploratory_report()
     st = status()
     if not st["ready"]:
         return {"verdict": "INSUFFICIENT_DATA",
@@ -614,7 +700,9 @@ if __name__ == "__main__":
     ap.add_argument("--status", action="store_true", help="查看数据准备度")
     ap.add_argument("--quality", type=int, nargs="?", const=5, metavar="N",
                     help="最近 N 日数据质量摘要（默认 5）")
-    ap.add_argument("--report", action="store_true", help="样本外报告")
+    ap.add_argument("--report", action="store_true", help="正式样本外报告（需 245 日）")
+    ap.add_argument("--preview", action="store_true",
+                    help="与 --report 配合：30 日探索性诊断（EXPLORATORY_ONLY，非正式结论）")
     ap.add_argument("--force", action="store_true",
                     help="绕过收盘闸门，允许盘中写存档（仅供复盘，会污染 PIT 证据链）")
     ap.add_argument("--pool", type=int, default=300)
@@ -633,4 +721,4 @@ if __name__ == "__main__":
     if a.quality is not None:
         print(json.dumps(quality_summary(a.quality), ensure_ascii=False, indent=2))
     if a.report:
-        print(json.dumps(report(), ensure_ascii=False, indent=2))
+        print(json.dumps(report(preview=a.preview), ensure_ascii=False, indent=2))
