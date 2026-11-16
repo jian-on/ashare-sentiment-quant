@@ -13,7 +13,10 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
                买入口径为 T+1 开盘（清单 T 日收盘后才生成），T+1 一字涨停剔除；
                双基准：候选池等权（衡量排序能力）+ 中证全指固定外部基准（衡量真实超额）
   3. report   — 按时序切 TRAIN/VALID/OOS + 5日 embargo，输出 Rank IC / ICIR、
-               相对外部基准的扣费净超额，以及「选池贡献 / 打分贡献 / 总超额」三段归因
+               相对外部基准的扣费净超额，以及「选池贡献 / 打分贡献 / 总超额」三段归因；
+               另按 10cm/20cm 板块分层检验 IC 是否同向（只诊断，不自动调权）
+  4. quality  — 每日数据质量留痕（asof 一致性、失效因子、舆情覆盖率、板块分布），
+               供发现「横截面残缺导致 z 失真」这类静默问题
 
 收盘闸门（2026-11-16）：早于 ARCHIVE_MIN_HHMM 一律拒绝写 PIT 存档，防止盘中
 未定型日K被固化进不可变截面。定时任务固定 15:50，正常路径不受影响；补标签不受闸门限制。
@@ -28,6 +31,7 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
   python backtest.py --label 20261113     # 该日 T+5 过后补标签
   python backtest.py --label-pending      # 扫描并补齐所有可补标签的存档
   python backtest.py --status             # 查看数据准备度
+  python backtest.py --quality [N]        # 最近 N 日数据质量摘要（默认 5）
   python backtest.py --report             # 出样本外报告（数据不足会明确拒绝）
 
 日志：data_cache/pit/daily_run.log（追加，UTF-8；目录已被 .gitignore 排除）
@@ -56,6 +60,15 @@ REQUIRED_DAYS = C.TRAIN_DAYS + C.VALID_DAYS + C.OOS_DAYS + C.EMBARGO_DAYS
 # 一字涨停买不到、K线缺失都会让个别标的没有标签。用覆盖率而非「全部非空」
 # 判定某日是否已完成标注，否则只要有一只缺失就会永远 pending、每天重复拉取。
 LABEL_COVERAGE_MIN = 0.80
+
+
+def _board_of(code: str) -> str:
+    """按代码前缀标记涨跌幅板：20cm（创业板/科创板）与 10cm（主板）。
+
+    ST 股已在 filter_universe 剔除（5cm 不退化为 10cm），北交所也不在候选池内。
+    这里只做分层诊断标签，不参与任何打分。
+    """
+    return "20cm" if str(code).zfill(6).startswith(C.BOARD_20CM_PREFIXES) else "10cm"
 
 
 def _ensure_dir():
@@ -133,10 +146,15 @@ def archive_cross_section(date_str: str | None = None, pool_size: int = 300,
     df["pool_ret_5d"] = np.nan
     df["mkt_ret_5d"] = np.nan
     df["benchmark_symbol"] = C.BENCHMARK_SYMBOL
+    # v3 新增：板块分层标签 + 当日数据质量留痕。不改动任何因子值，只增加可观测性。
+    df["board"] = df["code"].astype(str).map(_board_of)
+    df["quality_json"] = json.dumps(diag, ensure_ascii=False, default=str)
     # 口径版本：因子口径变更时旧存档必须被排除，绝不「旧因子值 + 新收益标签」混算
     df["pit_schema_version"] = C.PIT_SCHEMA_VERSION
     df.to_parquet(path, index=False)
-    _log(f"[存档] {date_str} 已写入 {len(df)} 只 / asof {asof} / 状态 {state} -> {path}")
+    board_mix = df["board"].value_counts().to_dict()
+    _log(f"[存档] {date_str} 已写入 {len(df)} 只 / asof {asof} / 状态 {state} "
+         f"/ 板块 {board_mix} -> {path}")
     return path
 
 
@@ -449,6 +467,12 @@ def daily_run(pool_size: int = 300) -> int:
     if archive_skipped:
         st["本次存档"] = f"跳过（{archive_skipped}）"
     _log("[状态] " + json.dumps(st, ensure_ascii=False))
+    try:
+        q = quality_summary(days=1)
+        if q["alerts"]:
+            _log("[质量] " + "；".join(q["alerts"][:3]))
+    except Exception as e:
+        _log(f"[质量] 摘要生成失败（不影响存档与补标签）：{type(e).__name__}: {e}")
     if not st["ready"]:
         _log(f"[结论] 数据不足（{st['已补标签天数']}/{st['需要天数']} 个已标注交易日），"
              f"拒绝给出任何有效性结论；本次仅完成存档与标签补齐")
@@ -467,6 +491,43 @@ def status() -> dict:
             "需要天数": REQUIRED_DAYS,
             "最早": dates[0] if dates else None, "最新": dates[-1] if dates else None,
             "ready": labeled >= REQUIRED_DAYS}
+
+
+def quality_summary(days: int = 5) -> dict:
+    """最近 N 日数据质量摘要：asof 一致性、有效权重、失效因子、舆情覆盖、板块分布。
+
+    这些字段在存档时由 score_pool 的 diag 原样写入 quality_json，不重算、不回溯修改，
+    因此可以用来发现「K线残缺 → 横截面 z 失真」这类不会报错但会毁掉证据的静默问题。
+    """
+    files = _current_schema_files()
+    if not files:
+        return {"n_days": 0, "note": "无当前版本存档（v1 旧存档不参与质量检查）"}
+    out, alerts = [], []
+    for fn in files[-max(1, days):]:
+        try:
+            df = pd.read_parquet(os.path.join(PIT_DIR, fn))
+            q = json.loads(df["quality_json"].iloc[0]) if "quality_json" in df else {}
+        except (KeyError, ValueError, TypeError, IndexError, OSError) as e:
+            alerts.append(f"{fn} 质量记录读取失败：{type(e).__name__}")
+            continue
+        rec = {"date": fn[:-len(".parquet")], "n_stocks": len(df),
+               "board": df["board"].value_counts().to_dict() if "board" in df else {},
+               "asof": q.get("asof"), "asof_ok": q.get("asof_ok"),
+               "asof_span_sec": q.get("asof_span_sec"),
+               "effective_weight_total": q.get("effective_weight_total"),
+               "dropped_factors": q.get("dropped_factors") or [],
+               "sentiment_coverage": q.get("sentiment_coverage"),
+               "sentiment_sources": q.get("sentiment_sources") or {}}
+        out.append(rec)
+        if rec["asof_ok"] is False:
+            alerts.append(f"{rec['date']} 截面时点不一致（跨度 {rec['asof_span_sec']}s）")
+        if rec["effective_weight_total"] is not None and rec["effective_weight_total"] < 0.999:
+            alerts.append(f"{rec['date']} 有效权重仅 {rec['effective_weight_total']}")
+        if rec["dropped_factors"]:
+            alerts.append(f"{rec['date']} 失效因子 {rec['dropped_factors']}")
+        if rec["sentiment_coverage"] is not None and rec["sentiment_coverage"] < 0.5:
+            alerts.append(f"{rec['date']} 舆情覆盖率仅 {rec['sentiment_coverage']}")
+    return {"n_days": len(out), "recent": out, "alerts": alerts[:20]}
 
 
 def report() -> dict:
@@ -500,6 +561,7 @@ def report() -> dict:
         "OOS": dates[oos_start:oos_start + C.OOS_DAYS],
     }
     out = {"verdict": None, "segments": {}, "state_layered_ic": {},
+           "board_layered_ic": {}, "board_layered_excess": {},
            "benchmark": {"symbol": C.BENCHMARK_SYMBOL, "label": C.BENCHMARK_LABEL}}
     for name, ds in segments.items():
         seg = p[p["date"].isin(ds)]
@@ -526,6 +588,20 @@ def report() -> dict:
         if s["n"] < C.MIN_STATE_SAMPLES:
             out["state_layered_ic"][str(state)]["note"] = \
                 f"样本 <{C.MIN_STATE_SAMPLES}，该状态不得单独定参，回退基准权重"
+
+    # 分板块检验（2026-11-16）：10cm/20cm 涨跌幅不同，low_vol 与量能因子分布会混合。
+    # 只诊断 IC 是否同向，不据此自动调权 —— 自由度增加必须有样本外证据才允许。
+    if "board" in p.columns:
+        for board, g in p[p["date"].isin(segments["OOS"])].groupby("board"):
+            ics = [_rank_ic(x["composite"], x["fwd_excess_5d"]) for _, x in g.groupby("date")]
+            s = _ic_stats(ics)
+            out["board_layered_ic"][str(board)] = s
+            out["board_layered_excess"][str(board)] = _net_excess(g, C.TOP_N)
+            if s["n"] < C.MIN_BOARD_SAMPLES:
+                out["board_layered_ic"][str(board)]["note"] = \
+                    f"样本 <{C.MIN_BOARD_SAMPLES}，该板块不单独定参；"
+                out["board_layered_ic"][str(board)]["note"] += \
+                    "两板块 IC 反向时须回退基准权重，不得按板块调权"
     return out
 
 
@@ -536,6 +612,8 @@ if __name__ == "__main__":
     ap.add_argument("--label", metavar="YYYYMMDD", help="补未来5日收益标签")
     ap.add_argument("--label-pending", action="store_true", help="补齐所有可补标签")
     ap.add_argument("--status", action="store_true", help="查看数据准备度")
+    ap.add_argument("--quality", type=int, nargs="?", const=5, metavar="N",
+                    help="最近 N 日数据质量摘要（默认 5）")
     ap.add_argument("--report", action="store_true", help="样本外报告")
     ap.add_argument("--force", action="store_true",
                     help="绕过收盘闸门，允许盘中写存档（仅供复盘，会污染 PIT 证据链）")
@@ -549,7 +627,10 @@ if __name__ == "__main__":
         label_forward_returns(a.label)
     if a.label_pending:
         label_pending()
-    if a.status or not any([a.archive, a.label, a.label_pending, a.report]):
+    if a.status or not any([a.archive, a.label, a.label_pending, a.quality is not None,
+                            a.report, a.force]):
         print(json.dumps(status(), ensure_ascii=False, indent=2))
+    if a.quality is not None:
+        print(json.dumps(quality_summary(a.quality), ensure_ascii=False, indent=2))
     if a.report:
         print(json.dumps(report(), ensure_ascii=False, indent=2))
