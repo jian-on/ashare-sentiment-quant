@@ -14,25 +14,59 @@ sentiment.py — 模块二：舆情情感打分（对接通义千问/Qwen，规�
 
 风险点：
 - 新闻偏媒体口径（理性），股吧偏散户情绪（极端），两者情绪分布不同，
-  混用时需在回测中分开验证（本模块 source 字段已区分）
+  混用时需在回测中分开验证（本模块 source / score_source 字段已区分）
 - LLM 打分存在漂移：同一文本不同批次分数可能不一致（temperature=0.1缓解，不能根除）
+
+2026-11-13 追加（point-in-time 口径）：
+- 原实现 `sort=default` 取单页 ≤50 条，**完全没用 date 字段**，旧闻与当日快讯等权
+  混算，短线情绪因子被稀释；历史重放还会构成 look-ahead。现改 `sort=time`
+  （实测单页 50 条全在近 10 天，default 有 6 条超龄）。
+- 现按发布日期过滤：剔除时间戳晚于 asof 的未来新闻、超过 NEWS_MAX_AGE_DAYS 的旧闻、
+  以及无法解析时点的新闻；其余按半衰期加权，mean_sentiment 为加权均值。
+  **重放历史截面必须显式传 asof=T日 23:59:59**（收盘后到次日开盘前的信息是可得的），
+  绝不能传重放当天的时间，否则未来新闻会被放行。
+- 每条新闻明细（含 time / age_days / weight / scorer）按日期落盘到
+  data_cache/pit/news/YYYYMMDD/<code>.json，供 point-in-time 重放与审计。
+- score_source 明确区分 RULE_BASED / QWEN / MIXED；因子层按此分组做横截面标准化，
+  不同打分器的原始分绝不直接混加。
 """
 import os
 import re
 import json
 import time
 import argparse
+import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 import requests
 
 import akshare as ak
+import config as C
 
 QWEN_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 QWEN_MODEL = "qwen-plus"          # 可换 qwen-turbo(快/便宜) 或 qwen-max(强/贵)
 BATCH_SIZE = 15                    # 每次API调用打包的帖子数（省token）
 MAX_POSTS = 50                     # 每只股票最多拉取的帖子数
+
+NEWS_ARCHIVE_ROOT = os.path.join(C.CACHE_DIR, "pit", "news")
+
+
+def _archive_posts(date_str: str, code: str, posts: list[dict]) -> None:
+    """每只股票一个独立 json，临时文件 + 原子替换，4 线程并发写不会互相覆盖。"""
+    if not C.NEWS_ARCHIVE or not date_str:
+        return
+    d = os.path.join(NEWS_ARCHIVE_ROOT, str(date_str))
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, f".{code}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"date": str(date_str), "code": str(code), "posts": posts},
+                      f, ensure_ascii=False, default=_json_default)
+        os.replace(tmp, os.path.join(d, f"{code}.json"))
+    except OSError as e:
+        print(f"[舆情归档失败 {code}] {type(e).__name__}: {e}")
 
 # ---------- Prompt（规则2：输出标准JSON） ----------
 SYSTEM_PROMPT = """你是A股财经舆情分析师。对每条股吧帖子做三项判断，严格输出JSON数组，不要任何多余文字：
@@ -78,11 +112,12 @@ def fetch_news_posts(code: str, max_posts: int = MAX_POSTS) -> pd.DataFrame | No
     """
     主数据源：东财个股新闻（requests直连，绕开akshare的pandas3.0兼容bug）。
     2026-11-02实测：字段 date/image/code/title/content/mediaName/url。
+    2026-11-13 改 sort=time 按发布时间倒序，单页不再被旧闻占满；time 列供时点过滤。
     """
     param = json.dumps({"uid": "", "keyword": code, "type": ["cmsArticleWebOld"],
                         "client": "web", "clientType": "web", "clientVersion": "curr",
                         "param": {"cmsArticleWebOld": {"searchScope": "default",
-                                   "sort": "default", "pageIndex": 1,
+                                   "sort": "time", "pageIndex": 1,
                                    "pageSize": min(max_posts, 100),
                                    "preTag": "", "postTag": ""}}})
     try:
@@ -163,59 +198,155 @@ def qwen_batch_score(texts: list[str]) -> list[dict] | None:
         return None
 
 
-def score_stock_sentiment(code: str, use_news_fallback: bool = True) -> dict:
+def _json_default(o):
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, (pd.Timestamp, dt.datetime)):
+        return o.isoformat()
+    return str(o)
+
+
+def _time_filter(posts: pd.DataFrame, asof: pd.Timestamp) -> tuple[pd.DataFrame, dict]:
     """
-    单只股票完整舆情打分流水线。
-    返回：{"code", "source", "n_posts", "n_used", "mean_sentiment",
-           "noise_ratio", "top_themes", "posts":[{标准JSON}]}
+    point-in-time 过滤 + 半衰期加权。四类新闻一律不进入短线情绪打分：
+    无发布时间（时点不可验证）、晚于 asof（未来新闻）、超过最大年龄（旧闻）、权重过低。
     """
+    stat = {"n_raw": 0, "n_future": 0, "n_stale": 0, "n_undated": 0, "n_low_weight": 0}
+    if posts is None or posts.empty:
+        return pd.DataFrame(), stat
+    d = posts.copy().reset_index(drop=True)
+    stat["n_raw"] = len(d)
+    if "time" in d.columns:
+        d["pub_ts"] = pd.to_datetime(d["time"], errors="coerce")
+    else:
+        d["pub_ts"] = pd.NaT
+    undated = d["pub_ts"].isna()
+    stat["n_undated"] = int(undated.sum())
+    d = d[~undated].copy()
+    if d.empty:
+        return d, stat
+    d["age_days"] = (asof - d["pub_ts"]).dt.total_seconds() / 86400.0
+    future = d["age_days"] < -(C.NEWS_FUTURE_TOL_MIN / 1440.0)
+    stat["n_future"] = int(future.sum())
+    d = d[~future].copy()
+    if d.empty:
+        return d, stat
+    stale = d["age_days"] > C.NEWS_MAX_AGE_DAYS
+    stat["n_stale"] = int(stale.sum())
+    d = d[~stale].copy()
+    if d.empty:
+        return d, stat
+    d["weight"] = np.power(0.5, np.maximum(d["age_days"].to_numpy(dtype=float), 0.0)
+                           / C.NEWS_HALF_LIFE_DAYS)
+    low = d["weight"] < C.NEWS_MIN_WEIGHT
+    stat["n_low_weight"] = int(low.sum())
+    d = d[~low].copy()
+    return d.reset_index(drop=True), stat
+
+
+def score_stock_sentiment(code: str, use_news_fallback: bool = True,
+                          asof=None, archive_date: str | None = None) -> dict:
+    """
+    单只股票完整舆情打分流水线（含时点过滤与明细落库）。
+
+    asof: 本次截面采集时刻；新闻发布日期晚于它的一律剔除，杜绝 look-ahead。
+    archive_date: 非空时把每条新闻明细落盘到 pit/news/<date>/<code>.json。
+    score_source: RULE_BASED / QWEN / MIXED / NONE，因子层据此分组标准化。
+    """
+    asof_ts = pd.Timestamp(asof) if asof is not None else pd.Timestamp.now()
     posts = fetch_guba_posts(code)
     src = "GUBA"
     if (posts is None or posts.empty) and use_news_fallback:
         posts = fetch_news_posts(code)
         src = "NEWS"
     if posts is None or posts.empty:
-        return {"code": code, "source": src, "n_posts": 0, "error": "无可用舆情文本"}
+        _archive_posts(archive_date, code, [])
+        return {"code": code, "source": src, "score_source": "NONE", "n_posts": 0,
+                "n_posts_raw": 0, "n_future": 0, "n_stale": 0, "n_undated": 0,
+                "n_low_weight": 0, "mean_sentiment": 0.0, "mean_sentiment_raw": 0.0,
+                "error": "无可用舆情文本", "asof": str(asof_ts), "posts": []}
 
-    texts = posts["text"].tolist()
+    d, tstat = _time_filter(posts, asof_ts)
+    if d.empty:
+        _archive_posts(archive_date, code, [])
+        return {"code": code, "source": src, "score_source": "NONE",
+                "n_posts": 0, "n_used": 0, "mean_sentiment": 0.0,
+                "mean_sentiment_raw": 0.0, "news_age_median": None,
+                "error": "时点过滤后无可用新闻", "asof": str(asof_ts),
+                **tstat, "posts": []}
+
+    texts = d["text"].tolist()
     n_api_fail = 0
     if os.environ.get("DASHSCOPE_API_KEY"):
-        results, n_api_fail = [], 0
+        results = []
         for i in range(0, len(texts), BATCH_SIZE):
             batch = texts[i:i + BATCH_SIZE]
             scored = qwen_batch_score(batch)
             if scored is None:
                 n_api_fail += len(batch)
-                scored = [rule_based_score(t) for t in batch]
-                results.extend(scored)
+                results.extend([dict(rule_based_score(t), scorer="RULE_BASED") for t in batch])
             else:
-                results.extend(scored)
+                results.extend([dict(x, scorer="QWEN") if x else
+                                dict(rule_based_score(t), scorer="RULE_BASED")
+                                for x, t in zip(scored, batch)])
             time.sleep(0.3)
         source = "QWEN" if n_api_fail == 0 else f"QWEN+RULE({n_api_fail}条降级)"
+        score_source = ("QWEN" if n_api_fail == 0 else
+                        "RULE_BASED" if n_api_fail == len(texts) else "MIXED")
     else:
-        results = [rule_based_score(t) for t in texts]
+        results = [dict(rule_based_score(t), scorer="RULE_BASED") for t in texts]
         source = "RULE_BASED"
+        score_source = "RULE_BASED"
 
-    df = pd.concat([posts.reset_index(drop=True), pd.DataFrame(results)], axis=1)
-    valid = df[~df["is_noise"]]
+    scored_df = pd.DataFrame(results)
+    for col in ("sentiment", "theme", "is_noise", "scorer"):
+        if col not in scored_df.columns:
+            scored_df[col] = None
+    scored_df["is_noise"] = scored_df["is_noise"].fillna(True).astype(bool)
+    scored_df["sentiment"] = pd.to_numeric(scored_df["sentiment"], errors="coerce").fillna(0.0)
+    scored_df["theme"] = scored_df["theme"].fillna("无明确题材")
+
+    df = pd.concat([d.reset_index(drop=True), scored_df.reset_index(drop=True)], axis=1)
+    valid = df[~df["is_noise"]].copy()
     themes = valid["theme"].value_counts().head(3).to_dict() if len(valid) else {}
+    if len(valid):
+        w = pd.to_numeric(valid["weight"], errors="coerce").fillna(0.0)
+        s = pd.to_numeric(valid["sentiment"], errors="coerce").fillna(0.0)
+        mean_w = float((s * w).sum() / w.sum()) if w.sum() > 0 else float(s.mean())
+        mean_raw = float(s.mean())
+    else:
+        mean_w = mean_raw = 0.0
 
-    return {"code": code, "source": source, "n_posts": len(df),
-            "n_used": len(valid), "noise_ratio": round(1 - len(valid) / max(len(df), 1), 2),
-            "mean_sentiment": round(valid["sentiment"].mean(), 3) if len(valid) else 0.0,
-            "top_themes": themes,
-            "posts": df[["text", "sentiment", "theme", "is_noise"]].to_dict("records")}
+    detail_cols = [c for c in ("text", "time", "age_days", "weight", "sentiment",
+                               "theme", "is_noise", "scorer") if c in df.columns]
+    records = df[detail_cols].to_dict("records")
+    _archive_posts(archive_date, code, records)
+    return {"code": code, "source": source, "score_source": score_source,
+            "n_posts": len(df), "n_used": len(valid),
+            "noise_ratio": round(1 - len(valid) / max(len(df), 1), 2),
+            "mean_sentiment": round(mean_w, 3), "mean_sentiment_raw": round(mean_raw, 3),
+            "news_age_median": round(float(df["age_days"].median()), 2) if len(df) else None,
+            "top_themes": themes, "asof": str(asof_ts),
+            "n_posts_raw": tstat["n_raw"], "n_future": tstat["n_future"],
+            "n_stale": tstat["n_stale"], "n_undated": tstat["n_undated"],
+            "n_low_weight": tstat["n_low_weight"], "posts": records}
 
 
-def batch_score(codes: list[str], workers: int = 4) -> list[dict]:
-    """并发打分（控制并发，防反爬/限流）。"""
+def batch_score(codes: list[str], workers: int = 4,
+                asof=None, archive_date: str | None = None) -> list[dict]:
+    """并发打分（控制并发，防反爬/限流）；透传 asof 与归档日期。"""
     out = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(score_stock_sentiment, c): c for c in codes}
+        futs = {ex.submit(score_stock_sentiment, c, True, asof, archive_date): c
+                for c in codes}
         for f in as_completed(futs):
             r = f.result()
-            print(f"[舆情] {r['code']}: source={r.get('source')} "
-                  f"情绪均值={r.get('mean_sentiment', '-')} 帖子={r.get('n_posts')}")
+            print(f"[舆情] {r['code']}: {r.get('score_source')} "
+                  f"情绪均值={r.get('mean_sentiment', '-')} "
+                  f"用{r.get('n_posts')}/{r.get('n_posts_raw')}条 "
+                  f"(未来{r.get('n_future')}/旧闻{r.get('n_stale')}/无时点{r.get('n_undated')})")
             out.append(r)
     return out
 

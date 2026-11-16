@@ -9,9 +9,14 @@ config.py 里的 COMMISSION / SLIPPAGE / TRAIN_DAYS / VALID_DAYS / OOS_DAYS
 
 本模块做三件事：
   1. archive  — 每次运行把当日完整横截面（因子 z、composite、状态、舆情源）落盘为不可变快照
-  2. label    — T+5 之后用项目自有腾讯K线补未来 5 日超额收益标签（不依赖付费 API）
-               买入口径为 T+1 开盘（清单 T 日收盘后才生成），T+1 一字涨停剔除
-  3. report   — 按时序切 TRAIN/VALID/OOS + 5日 embargo，输出 Rank IC / ICIR 与扣费净超额
+  2. label    — T+5 之后用项目自有腾讯K线补未来 5 日收益标签（不依赖付费 API）
+               买入口径为 T+1 开盘（清单 T 日收盘后才生成），T+1 一字涨停剔除；
+               双基准：候选池等权（衡量排序能力）+ 中证全指固定外部基准（衡量真实超额）
+  3. report   — 按时序切 TRAIN/VALID/OOS + 5日 embargo，输出 Rank IC / ICIR、
+               相对外部基准的扣费净超额，以及「选池贡献 / 打分贡献 / 总超额」三段归因
+
+收盘闸门（2026-11-16）：早于 ARCHIVE_MIN_HHMM 一律拒绝写 PIT 存档，防止盘中
+未定型日K被固化进不可变截面。定时任务固定 15:50，正常路径不受影响；补标签不受闸门限制。
 
 ⚠️ 诚实边界：需要积累 ≥ TRAIN+VALID+OOS+EMBARGO = 245 个交易日截面才有统计意义。
    数据不足时本模块**拒绝给出任何结论**，只报告 INSUFFICIENT_DATA。
@@ -35,6 +40,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import requests
 
 import config as C
 import data_loader as dl
@@ -73,12 +79,21 @@ def _path(date_str: str) -> str:
 
 
 # ---------------------------------------------------------------- 1. 存档
-def archive_cross_section(date_str: str | None = None, pool_size: int = 300) -> str:
+def archive_cross_section(date_str: str | None = None, pool_size: int = 300,
+                          force: bool = False) -> str:
     """
     把当日完整候选横截面落盘。这是 point-in-time 不可变存档：
     一旦写入不再修改因子值，只追加未来收益标签，保证回测不会用到「当时不可得」的信息。
+
+    force=True 才允许在收盘闸门之前写入（仅供盘中复盘，风险自负）；
+    默认拒绝，因为盘中日K末根未定型，写进去就永久污染这一天的截面。
     """
     _ensure_dir()
+    if not force and not is_after_close():
+        raise RuntimeError(
+            f"当前 {dt.datetime.now():%H:%M} 早于收盘闸门 {C.ARCHIVE_MIN_HHMM}，"
+            f"拒绝写 PIT 存档（盘中日K末根未定型，会永久污染当日截面）；"
+            f"请在收盘后重跑，或显式加 --force 用于盘中复盘")
     date_str = date_str or dt.date.today().strftime("%Y%m%d")
     path = _path(date_str)
     if os.path.exists(path):
@@ -95,9 +110,11 @@ def archive_cross_section(date_str: str | None = None, pool_size: int = 300) -> 
     pre = F.score_pool(pool, spot, market_score=thermo["market_score"], weights=weights)
     n_cov = min(len(pre), C.SENTIMENT_COVERAGE_N if C.SENTIMENT_COVERAGE_N > 0 else len(pre))
     codes = [str(c) for c in pre.head(n_cov)["code"]]
-    sent_map, sent_detail = RC._collect_sentiment(codes)
+    sent_map, sent_detail = RC._collect_sentiment(codes, archive_date=date_str, asof=asof)
+    source_map = {c: str(v.get("score_source", "UNKNOWN")) for c, v in sent_detail.items()}
     cand_pool = {c: pool[c] for c in codes if c in pool}
     scored, diag = F.score_pool(cand_pool, spot, sentiment_map=sent_map or None,
+                                sentiment_source_map=source_map or None,
                                 market_score=thermo["market_score"], weights=weights,
                                 return_diag=True)
 
@@ -109,14 +126,64 @@ def archive_cross_section(date_str: str | None = None, pool_size: int = 300) -> 
     df["weights_effective"] = json.dumps(diag["weights_effective"], ensure_ascii=False)
     df["sentiment_source"] = df["code"].map(
         {c: v.get("source", "UNKNOWN") for c, v in sent_detail.items()})
+    df["sentiment_score_source"] = df["code"].map(source_map)
     df["fwd_ret_5d"] = np.nan        # 标签位，T+5 后由 label 填充
-    df["fwd_excess_5d"] = np.nan
+    df["fwd_excess_5d"] = np.nan     # 相对候选池等权（衡量排序能力，IC 用）
+    df["fwd_excess_mkt_5d"] = np.nan  # 相对固定外部基准（衡量真实超额，净超额用）
+    df["pool_ret_5d"] = np.nan
+    df["mkt_ret_5d"] = np.nan
+    df["benchmark_symbol"] = C.BENCHMARK_SYMBOL
+    # 口径版本：因子口径变更时旧存档必须被排除，绝不「旧因子值 + 新收益标签」混算
+    df["pit_schema_version"] = C.PIT_SCHEMA_VERSION
     df.to_parquet(path, index=False)
     _log(f"[存档] {date_str} 已写入 {len(df)} 只 / asof {asof} / 状态 {state} -> {path}")
     return path
 
 
 # ---------------------------------------------------------------- 2. 标签
+def fetch_benchmark_return(date_str: str, horizon: int = 5) -> tuple[float | None, dict]:
+    """
+    固定外部基准（默认中证全指 sh000985）的 T+1 开盘 → T+horizon 收盘收益。
+
+    为什么需要：原 fwd_excess_5d 减的是「当日候选池等权」，而候选池是模型自己选出来的，
+    基准随选样漂移，超额收益的含义不稳定，也无法区分「选池赚的」和「排序赚的」。
+    指数与个股标签同口径、不受本项目选样影响，是唯一可跨日比较的锚。
+    """
+    sym = C.BENCHMARK_SYMBOL
+    info = {"symbol": sym, "label": C.BENCHMARK_LABEL, "n_bars": 0}
+    try:
+        url = getattr(SRC, "_working_url", {}).get("url", SRC.TX_KLINE_URLS[0])
+        r = requests.get(url, params={"param": f"{sym},day,,,30,qfq"}, timeout=12,
+                         headers={**SRC._UA, "Referer": "https://gu.qq.com/"})
+        d = r.json()
+        node = (d.get("data") or {}).get(sym) or {}
+        k = node.get("qfqday") or node.get("day") or []
+        if not k:
+            info["error"] = "指数K线为空"
+            return None, info
+        h = pd.DataFrame([{"date": x[0], "open": float(x[1]), "close": float(x[2])}
+                          for x in k if len(x) >= 3])
+        h["date"] = pd.to_datetime(h["date"])
+        t0 = pd.to_datetime(date_str, format="%Y%m%d")
+        pos = h.index[h["date"] >= t0]
+        info["n_bars"] = len(h)
+        if len(pos) == 0 or pos[0] + horizon >= len(h):
+            info["error"] = f"T+{horizon} 尚未到来"
+            return None, info
+        i = pos[0]
+        buy, sell = float(h.loc[i + 1, "open"]), float(h.loc[i + horizon, "close"])
+        if buy <= 0:
+            info["error"] = "指数开盘价异常"
+            return None, info
+        info.update({"buy_date": str(h.loc[i + 1, "date"].date()),
+                     "sell_date": str(h.loc[i + horizon, "date"].date()),
+                     "buy": round(buy, 3), "sell": round(sell, 3)})
+        return sell / buy - 1, info
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+        return None, info
+
+
 def label_forward_returns(date_str: str, horizon: int = 5) -> int:
     """
     用项目自有腾讯前复权K线补 T+1~T+horizon 收益标签，零新增依赖、零付费 API。
@@ -127,7 +194,8 @@ def label_forward_returns(date_str: str, horizon: int = 5) -> int:
     if not os.path.exists(path):
         raise FileNotFoundError(f"无 {date_str} 存档，请先 --archive")
     df = pd.read_parquet(path)
-    if len(df) and df["fwd_excess_5d"].notna().mean() >= LABEL_COVERAGE_MIN:
+    if "fwd_excess_mkt_5d" in df.columns and len(df) \
+            and df["fwd_excess_mkt_5d"].notna().mean() >= LABEL_COVERAGE_MIN:
         _log(f"[标签] {date_str} 已完成，跳过")
         return 0
 
@@ -168,12 +236,22 @@ def label_forward_returns(date_str: str, horizon: int = 5) -> int:
         _log(f"[标签] {date_str} 仅取到 {len(rets)}/{len(df)} 只，"
              f"T+{horizon} 可能尚未到来，保持 pending")
         return 0
+    bench_mkt, bench_info = fetch_benchmark_return(date_str, horizon)
+    if bench_mkt is None:
+        _log(f"[标签] {date_str} 外部基准不可用（{bench_info.get('error')}），"
+             f"保持 pending；绝不退回池内基准，以免新旧样本口径不一致")
+        return 0
     bench = float(np.mean(list(rets.values())))
     df["fwd_ret_5d"] = df["code"].astype(str).map(rets)
-    df["fwd_excess_5d"] = df["fwd_ret_5d"] - bench
+    df["fwd_excess_5d"] = df["fwd_ret_5d"] - bench            # 相对候选池：衡量排序能力
+    df["fwd_excess_mkt_5d"] = df["fwd_ret_5d"] - bench_mkt    # 相对市场：衡量真实超额
+    df["pool_ret_5d"] = bench
+    df["mkt_ret_5d"] = bench_mkt
+    df["benchmark_symbol"] = bench_info["symbol"]
     df.to_parquet(path, index=False)
     _log(f"[标签] {date_str} 完成 {len(rets)} 只 / 一字涨停剔除 {n_unbuyable} 只"
-         f" / 基准收益 {bench:+.4f}（T+1开盘买 → T+{horizon}收盘卖）")
+         f" | 池 {bench:+.4f} / {bench_info['label']} {bench_mkt:+.4f}"
+         f"（T+1开盘买 → T+{horizon}收盘卖）")
     return len(rets)
 
 
@@ -201,25 +279,62 @@ def _ic_stats(ics: list[float]) -> dict:
 
 
 def _net_excess(seg: pd.DataFrame, top_n: int) -> dict:
-    """Top N 等权的扣费净超额（对齐横截面排序目标，非绝对收益）"""
-    vals = []
+    """
+    Top N 等权的扣费净超额（相对固定外部基准）+ 三段归因：
+      选池贡献 = 候选池等权 − 市场基准        （选了什么池子）
+      打分贡献 = TopN − 候选池等权            （池内排序能力，即 fwd_excess_5d）
+      总超额   = 选池贡献 + 打分贡献          （= TopN − 市场基准）
+    IC/ICIR 仍用池内相对收益衡量排序能力；净超额必须用市场基准衡量真实组合收益。
+    """
+    cost = 2 * (C.COMMISSION + C.SLIPPAGE) + C.STAMP_TAX   # 佣金/滑点双边 + 印花税卖出单边
+    vals, picks, sorts, totals = [], [], [], []
     for _, g in seg.groupby("date"):
+        if "fwd_excess_mkt_5d" not in g.columns:
+            continue                       # 老 schema 存档不参与，避免口径混算
         top = g.nlargest(min(top_n, len(g)), "composite")
-        if len(top) == 0 or top["fwd_excess_5d"].notna().mean() < LABEL_COVERAGE_MIN:
-            continue                       # Top 名单标签覆盖不足，该日不参与净超额统计
-        gross = float(top["fwd_excess_5d"].mean())
-        # 买入+卖出各一次：佣金/滑点双边，印花税卖出单边
-        cost = 2 * (C.COMMISSION + C.SLIPPAGE) + C.STAMP_TAX
+        if len(top) == 0 or top["fwd_excess_mkt_5d"].notna().mean() < LABEL_COVERAGE_MIN:
+            continue
+        gross = float(top["fwd_excess_mkt_5d"].mean())
+        sort_v = float(top["fwd_excess_5d"].mean())
+        pick_v = float(top["pool_ret_5d"].iloc[0]) - float(top["mkt_ret_5d"].iloc[0])
         vals.append(gross - cost)
+        picks.append(pick_v)
+        sorts.append(sort_v)
+        totals.append(gross)
     if not vals:
-        return {"n": 0, "net_excess_mean": None}
+        return {"n": 0, "net_excess_mean": None,
+                "attribution": {"note": "无可用样本或全为老 schema"}}
+    attr = {"pool_selection": round(float(np.mean(picks)), 5),
+            "cross_section_sort": round(float(np.mean(sorts)), 5),
+            "gross_total": round(float(np.mean(totals)), 5),
+            "cost_per_period": round(cost, 5),
+            "identity_check": round(float(np.mean(picks) + np.mean(sorts)
+                                          - np.mean(totals)), 6)}
     return {"n": len(vals), "net_excess_mean": round(float(np.mean(vals)), 5),
-            "net_excess_std": round(float(np.std(vals, ddof=1)), 5) if len(vals) > 1 else None}
+            "net_excess_std": round(float(np.std(vals, ddof=1)), 5) if len(vals) > 1 else None,
+            "attribution": attr}
+
+
+def _current_schema_files() -> list[str]:
+    """
+    只返回当前口径版本的存档文件名。旧版本文件保留在磁盘供审计，但绝不进入
+    回测面板、也不再补标签 —— 否则会形成「旧因子值 + 新收益标签」的混杂面板。
+    """
+    _ensure_dir()
+    out = []
+    for fn in sorted(f for f in os.listdir(PIT_DIR) if f.endswith(".parquet")):
+        try:
+            v = pd.read_parquet(os.path.join(PIT_DIR, fn),
+                                columns=["pit_schema_version"])["pit_schema_version"].iloc[0]
+        except (KeyError, ValueError, IndexError, OSError):
+            continue                    # 无版本列 / 空文件 = v1 老存档，排除
+        if int(v) == C.PIT_SCHEMA_VERSION:
+            out.append(fn)
+    return out
 
 
 def load_panel() -> pd.DataFrame:
-    _ensure_dir()
-    files = sorted(f for f in os.listdir(PIT_DIR) if f.endswith(".parquet"))
+    files = _current_schema_files()
     if not files:
         return pd.DataFrame()
     return pd.concat([pd.read_parquet(os.path.join(PIT_DIR, f)) for f in files],
@@ -227,6 +342,19 @@ def load_panel() -> pd.DataFrame:
 
 
 # ------------------------------------------------- 4. 盘后无人值守流水线
+def is_after_close(now: dt.datetime | None = None) -> bool:
+    """
+    收盘闸门：本机时钟为北京时间，早于 ARCHIVE_MIN_HHMM 一律不得写 PIT 存档。
+
+    为什么不用快照 asof 判断：停牌/僵死股的最后成交时间会停留在早盘，若按 asof
+    阻断会重新引入「收盘后误判为盘中」的老 bug（factors.py 已为此改过一次）。
+    因此只用本机时钟做硬闸门，asof 仅用于截面一致性诊断。
+    """
+    now = now or dt.datetime.now()
+    hh, mm = (int(x) for x in C.ARCHIVE_MIN_HHMM.split(":"))
+    return (now.hour, now.minute) >= (hh, mm)
+
+
 def spot_trading_day(spot: pd.DataFrame) -> tuple[bool, str | None]:
     """
     用腾讯快照字段 30 的行情日期众数判定「今天是不是交易日」。
@@ -255,7 +383,7 @@ def label_pending(min_age_days: int = 5) -> int:
     _ensure_dir()
     today = dt.date.today()
     done = 0
-    for fn in sorted(f for f in os.listdir(PIT_DIR) if f.endswith(".parquet")):
+    for fn in _current_schema_files():      # 老口径存档直接跳过，不重复拉 K 线
         date_str = fn[:-len(".parquet")]
         try:
             d = dt.datetime.strptime(date_str, "%Y%m%d").date()
@@ -265,12 +393,14 @@ def label_pending(min_age_days: int = 5) -> int:
             continue
         path = os.path.join(PIT_DIR, fn)
         try:
-            col = pd.read_parquet(path, columns=["fwd_excess_5d"])["fwd_excess_5d"]
+            head = pd.read_parquet(path)
+            col = head["fwd_excess_mkt_5d"] if "fwd_excess_mkt_5d" in head.columns else None
         except Exception as e:
             _log(f"[标签] {date_str} 读取失败：{type(e).__name__}: {e}")
             continue
-        if len(col) and col.notna().mean() >= LABEL_COVERAGE_MIN:
+        if col is not None and len(col) and col.notna().mean() >= LABEL_COVERAGE_MIN:
             continue                       # 已完成，幂等跳过
+        # 缺 fwd_excess_mkt_5d 的老存档会被重新标注，自动补齐新 schema
         try:
             n = label_forward_returns(date_str)
             if n:
@@ -293,20 +423,31 @@ def daily_run(pool_size: int = 300) -> int:
         spot = None
         failed = True
 
+    archive_skipped = None
     if spot is not None:
         is_td, mode_day = spot_trading_day(spot)
-        if is_td:
+        if not is_td:
+            _log(f"[存档] 今日非交易日（快照行情日 {mode_day or '无法解析'} ≠ {today}），"
+                 f"跳过存档，避免重复截面")
+            archive_skipped = "非交易日"
+        elif not is_after_close():
+            _log(f"[存档] {today} 当前 {dt.datetime.now():%H:%M} 早于收盘闸门 "
+                 f"{C.ARCHIVE_MIN_HHMM}，跳过存档（日K末根未定型，写进去会永久污染截面）；"
+                 f"请在收盘后重跑 --daily；补标签照常执行")
+            archive_skipped = "盘中提前执行"
+        else:
             try:
                 archive_cross_section(today, pool_size=pool_size)
             except Exception as e:
                 _log(f"[存档] {today} 失败：{type(e).__name__}: {e}")
                 failed = True
-        else:
-            _log(f"[存档] 今日非交易日（快照行情日 {mode_day or '无法解析'} ≠ {today}），"
-                 f"跳过存档，避免重复截面")
+    else:
+        archive_skipped = "快照获取失败"
 
-    n = label_pending()                     # 休市日同样可补标签
+    n = label_pending()                     # 休市日、盘中提前执行时同样可补标签
     st = status()
+    if archive_skipped:
+        st["本次存档"] = f"跳过（{archive_skipped}）"
     _log("[状态] " + json.dumps(st, ensure_ascii=False))
     if not st["ready"]:
         _log(f"[结论] 数据不足（{st['已补标签天数']}/{st['需要天数']} 个已标注交易日），"
@@ -318,8 +459,10 @@ def daily_run(pool_size: int = 300) -> int:
 def status() -> dict:
     p = load_panel()
     dates = sorted(p["date"].unique()) if len(p) else []
-    labeled = int(p.groupby("date")["fwd_excess_5d"]
-                  .apply(lambda s: s.notna().mean() >= LABEL_COVERAGE_MIN).sum()) if dates else 0
+    # 只有带「市场超额」列的存档才算已标注；老 schema 必须重新标注，避免口径混算
+    labeled = int(p.groupby("date")["fwd_excess_mkt_5d"]
+                  .apply(lambda s: s.notna().mean() >= LABEL_COVERAGE_MIN).sum()) \
+        if dates and "fwd_excess_mkt_5d" in p.columns else 0
     return {"存档天数": len(dates), "已补标签天数": labeled,
             "需要天数": REQUIRED_DAYS,
             "最早": dates[0] if dates else None, "最新": dates[-1] if dates else None,
@@ -338,7 +481,12 @@ def report() -> dict:
                           f"本模块拒绝在数据不足时给出任何有效性结论",
                 **st}
     p = load_panel()
-    p = p[p["fwd_excess_5d"].notna()].copy()
+    need = ["fwd_excess_5d", "fwd_excess_mkt_5d", "pool_ret_5d", "mkt_ret_5d"]
+    missing = [c for c in need if c not in p.columns]
+    if missing:
+        return {"verdict": "SCHEMA_MISMATCH",
+                "reason": f"面板缺少 {missing}；请用当前代码重新标注后再出报告", **st}
+    p = p[p["fwd_excess_5d"].notna() & p["fwd_excess_mkt_5d"].notna()].copy()
     dates = sorted(p["date"].unique())
     n = len(dates)
     # 三段 + 段间 embargo：留出 2*EMBARGO_DAYS 天不参与定参/评价
@@ -351,7 +499,8 @@ def report() -> dict:
         "VALID": dates[tr_end + e:va_end],
         "OOS": dates[oos_start:oos_start + C.OOS_DAYS],
     }
-    out = {"verdict": None, "segments": {}, "state_layered_ic": {}}
+    out = {"verdict": None, "segments": {}, "state_layered_ic": {},
+           "benchmark": {"symbol": C.BENCHMARK_SYMBOL, "label": C.BENCHMARK_LABEL}}
     for name, ds in segments.items():
         seg = p[p["date"].isin(ds)]
         ics = [_rank_ic(g["composite"], g["fwd_excess_5d"]) for _, g in seg.groupby("date")]
@@ -365,7 +514,9 @@ def report() -> dict:
           and oos["p_approx"] is not None and oos["p_approx"] < 0.05
           and oos.get("net_excess_mean") is not None and oos["net_excess_mean"] > 0)
     out["verdict"] = "PASS_OOS" if ok else "FAIL_REVERT_TO_BASELINE"
-    out["criteria"] = "OOS: IC>0 且 ICIR>=0.30 且 IC>0占比>=55% 且 p<0.05 且扣费净超额>0"
+    out["criteria"] = ("OOS: IC>0 且 ICIR>=0.30 且 IC>0占比>=55% 且 p<0.05 "
+                       "且相对固定外部基准的扣费净超额>0；IC 用池内相对收益衡量排序，"
+                       "净超额用市场基准衡量真实收益；attribution 拆选池/打分贡献")
 
     # 分市场状态检验（factors.py 顶部风险提示明确要求）
     for state, g in p[p["date"].isin(segments["OOS"])].groupby("state"):
@@ -386,12 +537,14 @@ if __name__ == "__main__":
     ap.add_argument("--label-pending", action="store_true", help="补齐所有可补标签")
     ap.add_argument("--status", action="store_true", help="查看数据准备度")
     ap.add_argument("--report", action="store_true", help="样本外报告")
+    ap.add_argument("--force", action="store_true",
+                    help="绕过收盘闸门，允许盘中写存档（仅供复盘，会污染 PIT 证据链）")
     ap.add_argument("--pool", type=int, default=300)
     a = ap.parse_args()
     if a.daily:
         raise SystemExit(daily_run(pool_size=a.pool))
     if a.archive:
-        archive_cross_section(pool_size=a.pool)
+        archive_cross_section(pool_size=a.pool, force=a.force)
     if a.label:
         label_forward_returns(a.label)
     if a.label_pending:

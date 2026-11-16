@@ -114,6 +114,7 @@ def _effective_weights(df: pd.DataFrame, weights: dict) -> tuple[dict, list[str]
 
 def score_pool(pool: dict[str, pd.DataFrame], spot: pd.DataFrame,
                sentiment_map: dict[str, float] | None = None,
+               sentiment_source_map: dict[str, str] | None = None,
                market_score: float | None = None,
                weights: dict | None = None,
                return_diag: bool = False) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
@@ -122,6 +123,8 @@ def score_pool(pool: dict[str, pd.DataFrame], spot: pd.DataFrame,
 
     pool: {code: 前复权df}; spot: 实时快照
     sentiment_map: {code: 舆情原始分}；内部做横截面标准化，缺失记中性并计入覆盖率
+    sentiment_source_map: {code: RULE_BASED/QWEN/MIXED}；不同打分器原始分量纲不同，
+                          按组分别标准化，避免把规则词典分与 LLM 分直接混加
     market_score: 市场情绪温度(-1~1)，仅用于诊断/状态判定，不再作为常数因子加权
     weights: 覆盖权重（供市场状态自适应实验使用）；None 用 config.FACTOR_WEIGHTS
     return_diag: True 时返回 (df, 诊断dict)，诊断含有效权重、被剔除因子、舆情覆盖率
@@ -179,7 +182,18 @@ def score_pool(pool: dict[str, pd.DataFrame], spot: pd.DataFrame,
     else:
         sent_raw = pd.Series(0.0, index=df.index)
         coverage = 0.0
-    df["sentiment"] = winsorize_z(sent_raw)
+    source_counts = {}
+    if sentiment_source_map:
+        src = pd.Series({c: str(sentiment_source_map.get(c, "UNKNOWN")) for c in df.index})
+        source_counts = {str(k): int(v) for k, v in src.value_counts().items()}
+
+        def _z_group(s):
+            # 组内样本 <5 时 z 无统计意义，记中性而非制造虚假离散度
+            return winsorize_z(s) if len(s) >= 5 else pd.Series(0.0, index=s.index)
+
+        df["sentiment"] = sent_raw.groupby(src).transform(_z_group)
+    else:
+        df["sentiment"] = winsorize_z(sent_raw)
 
     # 仅诊断：市场温度是截面常数，绝不参与 composite
     df["market_beta"] = float(market_score) if market_score is not None else 0.0
@@ -225,6 +239,7 @@ def score_pool(pool: dict[str, pd.DataFrame], spot: pd.DataFrame,
         "effective_weight_total": round(sum(live_w.values()), 4),
         "dropped_factors": dropped,
         "sentiment_coverage": round(coverage, 4),
+        "sentiment_sources": source_counts,
         "turnover_source": turnover_src,
         "market_score": market_score,
         **asof_info,

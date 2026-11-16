@@ -42,7 +42,9 @@ def _load_sent_cache() -> dict:
     try:
         with open(_SENT_CACHE, "r", encoding="utf-8") as f:
             d = json.load(f)
-        if (time.time() - d.get("ts", 0)) <= C.SENTIMENT_CACHE_TTL_SEC \
+        # 口径变更（时点过滤/衰减/分来源）后旧缓存必须失效，否则新旧分混在同一次检验里
+        if d.get("version") == C.SENTIMENT_CACHE_VERSION \
+                and (time.time() - d.get("ts", 0)) <= C.SENTIMENT_CACHE_TTL_SEC \
                 and d.get("date") == dt.date.today().isoformat():
             return d.get("data", {})
     except (OSError, ValueError, AttributeError):
@@ -55,35 +57,50 @@ def _save_sent_cache(data: dict) -> None:
         os.makedirs(C.CACHE_DIR, exist_ok=True)
         with open(_SENT_CACHE, "w", encoding="utf-8") as f:
             json.dump({"ts": time.time(), "date": dt.date.today().isoformat(),
-                       "data": data}, f, ensure_ascii=False)
+                       "version": C.SENTIMENT_CACHE_VERSION, "data": data},
+                      f, ensure_ascii=False)
     except OSError:
         pass
 
 
-def _collect_sentiment(codes: list[str]) -> tuple[dict, dict]:
+def _collect_sentiment(codes: list[str], archive_date: str | None = None,
+                       asof: str | None = None) -> tuple[dict, dict]:
     """
     对候选集全量补舆情（带当日缓存）。失败的单只记中性 0 并在 detail 里标注，
     绝不把「没取到」当成「舆情差」而静默惩罚。
+
+    archive_date 非空时，把每只股票的新闻明细（含发布时间与权重）落盘，
+    保证缓存命中的股票也有 point-in-time 重放依据。
     """
     cache = _load_sent_cache()
     need = [c for c in codes if c not in cache]
-    detail = {c: cache[c] for c in codes if c in cache}
     if need:
         try:
-            for r in batch_score(need, workers=4):
+            for r in batch_score(need, workers=4, asof=asof, archive_date=archive_date):
                 c = str(r.get("code"))
-                item = {k: v for k, v in r.items() if k != "posts"}
                 if "error" in r:
-                    item["mean_sentiment"] = 0.0
-                    item["degraded"] = True
-                detail[c] = item
-                cache[c] = item
+                    r["mean_sentiment"] = 0.0
+                    r["degraded"] = True
+                cache[c] = r                      # 完整结果（含 posts），供归档重放
         except Exception as e:
             print(f"[舆情] 批量打分失败，全部记中性：{type(e).__name__}: {e}")
             for c in need:
-                detail[c] = {"code": c, "mean_sentiment": 0.0, "degraded": True}
-                cache[c] = detail[c]
+                cache[c] = {"code": c, "mean_sentiment": 0.0,
+                            "score_source": "NONE", "degraded": True, "posts": []}
         _save_sent_cache(cache)
+
+    detail = {}
+    for c in codes:
+        r = cache.get(c, {})
+        item = {k: v for k, v in r.items() if k != "posts"}
+        detail[c] = item
+        if archive_date:
+            # batch_score 已写过新抓的；这里补齐缓存命中但尚未落盘的
+            p = os.path.join(C.CACHE_DIR, "pit", "news", str(archive_date), f"{c}.json")
+            if not os.path.exists(p):
+                from sentiment import _archive_posts
+                _archive_posts(archive_date, c, r.get("posts", []))
+
     sent_map = {c: float(v.get("mean_sentiment", 0.0) or 0.0) for c, v in detail.items()}
     return sent_map, detail
 
@@ -101,7 +118,8 @@ def _reason(row: pd.Series, weights: dict, top_k: int = 2) -> str:
 
 
 def build_recommend_list(top_n: int = 10, pool_size: int = 300,
-                         with_sentiment: bool = True) -> dict:
+                         with_sentiment: bool = True,
+                         archive_date: str | None = None) -> dict:
     asof = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     spot = dl.get_spot()
     uni = dl.filter_universe(spot)
@@ -120,11 +138,15 @@ def build_recommend_list(top_n: int = 10, pool_size: int = 300,
 
     sent_map, sent_detail = {}, {}
     if with_sentiment:
-        sent_map, sent_detail = _collect_sentiment(cand_codes)
+        sent_map, sent_detail = _collect_sentiment(cand_codes, archive_date=archive_date,
+                                                   asof=asof)
+    # RULE_BASED / QWEN 原始分量纲不同，按打分器分组做横截面标准化，绝不直接混加
+    source_map = {c: str(v.get("score_source", "UNKNOWN")) for c, v in sent_detail.items()}
 
     # ---- 二期：只在同一候选集横截面内打分，未打分者不进入，避免「0 分=看空」误判 ----
     cand_pool = {c: pool[c] for c in cand_codes if c in pool}
     scored, diag = F.score_pool(cand_pool, spot, sentiment_map=sent_map or None,
+                                sentiment_source_map=source_map or None,
                                 market_score=thermo["market_score"], weights=weights,
                                 return_diag=True)
     top = scored.head(top_n).copy()
